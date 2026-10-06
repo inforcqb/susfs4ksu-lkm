@@ -40,10 +40,21 @@
 /* Longest registered path; 256 matches the ABI's target_pathname field. */
 #define SUS_PATH_LEN 256
 
-#define __NR_compat_getdents64 217
-#define __NR_compat_getdents 141
-#define __NR_native_getdents64 61
-#define __NR_native_getdents 106
+/* Directory-listing syscall numbers.
+ *
+ * The native one is this build tree's own UAPI macro (<asm/unistd.h> via syscalls.h): syscall
+ * numbers are ABI, not per-device - every arm64 kernel from 5.10 to 6.18 numbers getdents64 61,
+ * because userspace binaries have the number baked into their SVC sequence.  The AArch32 pair
+ * has no macro in an arm64 tree, so it is written out from the 32-bit ARM table
+ * (arch/arm/tools/syscall.tbl): getdents 141, getdents64 217.
+ *
+ * A number on its own still does not identify the call, and the two tables collide by design:
+ * arm64's native 141 is getpriority, its 106 delete_module, its 217 add_key, and its
+ * 195/196/197 shmctl/shmat/shmdt, while AArch32 gives 141/217 to the two getdents and
+ * 195/196/197 to stat64/lstat64/fstat64.  Every match is therefore gated on the caller's ABI -
+ * here in sus_path_dirent_layout_id(), and the same way in susfs_kstat.c for the stat family. */
+#define SUS_NR_GETDENTS64_COMPAT 217
+#define SUS_NR_GETDENTS_COMPAT   141
 
 struct linux_dirent64 {
     u64 d_ino;
@@ -938,31 +949,37 @@ static const char *sus_path_dirent_abi_name(int lay_id)
 static long sus_path_filter(unsigned long buf, long count,
                             const struct sus_dirent_layout *lay);
 
-long sus_path_dirent_filter(long syscall_nr, unsigned long buf, long ret)
+/* Which dirent layout this syscall denotes for a task running the given ABI, or -1 for "not a
+ * listing call".  The ABI gate is the whole point of this function: matching the bare number
+ * made every native getpriority (141) look like an AArch32 getdents, so the module took the
+ * nice value (1..40) for a byte count and the `who` tid for a user buffer it then failed to
+ * read - a warning at the ratelimit on a completely unrelated syscall. */
+int sus_path_dirent_layout_id(long syscall_nr, bool compat)
 {
+    if (compat) {
+        if (syscall_nr == SUS_NR_GETDENTS_COMPAT)
+            return SUS_DIRENT_COMPAT;
+        if (syscall_nr == SUS_NR_GETDENTS64_COMPAT)
+            return SUS_DIRENT_L64;
+        return -1;
+    }
+    return syscall_nr == __NR_getdents64 ? SUS_DIRENT_L64 : -1;
+}
+
+/* lay_id comes from sus_path_dirent_layout_id(); buf/ret are only read for a listing call. */
+long sus_path_dirent_filter(int lay_id, unsigned long buf, long ret)
+{
+    /* The counters are indexed by this id, so an id that did not come from the classifier is
+     * answered with "nothing filtered" instead of being used as an index. */
+    if (lay_id < 0 || lay_id >= SUS_DIRENT_N)
+        return ret;
+
     if (ret <= 0) {
-
-        if (syscall_nr == __NR_native_getdents64 || syscall_nr == __NR_compat_getdents64 ||
-            syscall_nr == __NR_compat_getdents) {
-            int id = (syscall_nr == __NR_compat_getdents) ? SUS_DIRENT_COMPAT : SUS_DIRENT_L64;
-
-            atomic_inc(&n_dirent_syscall_bad[id]);
-        }
+        atomic_inc(&n_dirent_syscall_bad[lay_id]);
         return ret;
     }
-
-    switch (syscall_nr) {
-    case __NR_native_getdents64:
-    case __NR_compat_getdents64:
-        return sus_path_filter(buf, ret, &sus_dirent_l64);
-    case __NR_compat_getdents:
-        return sus_path_filter(buf, ret, &sus_dirent_compat);
-    case __NR_native_getdents:
-
-        return sus_path_filter(buf, ret, &sus_dirent_l64);
-    default:
-        return ret;
-    }
+    return sus_path_filter(buf, ret, lay_id == SUS_DIRENT_COMPAT ? &sus_dirent_compat
+                                                                 : &sus_dirent_l64);
 }
 
 int sus_path_dirent_stat_line(char *buf, size_t size)

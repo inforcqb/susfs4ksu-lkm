@@ -567,14 +567,15 @@ static bool susfs_kstat_spoof_statbuf(struct kstat_call_state *st, unsigned long
 #define STAT64_ST_INO_OFF       96	/* compat_u64 st_ino (also written; the KEY is read from +12) */
 #define STAT64_ST_SIZE          104
 
+/* AArch32 stat numbers, from the 32-bit ARM table (arch/arm/tools/syscall.tbl) - an arm64 tree
+ * has no macro for them.  They are only reached for a task running that ABI: arm64's native
+ * 195/196/197 are shmctl/shmat/shmdt (whose second argument is an address or a small integer,
+ * not a statbuf) and its native 79/80 are newfstatat/fstat, which AArch32 numbers 79/80 give to
+ * settimeofday/getgroups. */
 #define COMPAT_FSTATAT64_NR	327	/* fstatat64(dfd, path, statbuf, flag) */
 #define COMPAT_STAT64_NR	195	/* stat64(path, statbuf) */
 #define COMPAT_LSTAT64_NR	196	/* lstat64(path, statbuf) */
 #define COMPAT_FSTAT64_NR	197	/* fstat64(fd, statbuf) */
-
-#define KSTAT_NR_GETDENTS64	61
-#define COMPAT_GETDENTS64_NR	217
-#define COMPAT_GETDENTS_NR	141
 
 struct kstat_nr_entry {
 	long nr;
@@ -928,51 +929,76 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 	struct kstat_call_counters *c;
 	struct kstat_call_state st;
 	long nr = syscall_get_nr(current, regs);
+	bool compat = is_compat_task();
+	int lay = sus_path_dirent_layout_id(nr, compat);
 
-	if (nr == KSTAT_NR_GETDENTS64 || nr == COMPAT_GETDENTS64_NR ||
-	    nr == COMPAT_GETDENTS_NR) {
+	if (lay >= 0) {
 		long rc;
 
+		/* The number alone does not identify the call (native 141 is getpriority, not
+		 * the AArch32 getdents): sus_path_dirent_layout_id() gates it on the ABI, so
+		 * anything that is not really a listing leaves here before the arguments are
+		 * read. */
+		if (ret <= 0) {
+			sus_path_dirent_filter(lay, 0, ret);
+			return;
+		}
 		syscall_get_arguments(current, regs, args);
-
-		rc = sus_path_dirent_filter(nr,
-					    is_compat_task()
-						    ? (unsigned long)compat_ptr((u32)args[1])
-						    : args[1],
+		rc = sus_path_dirent_filter(lay,
+					    compat ? (unsigned long)compat_ptr((u32)args[1])
+						   : args[1],
 					    ret);
 		if (rc != ret)
 			syscall_set_return_value(current, regs, 0, rc);
 		return;
 	}
 
-	/* ---- stat family: number -> counters -> argument positions ---- */
-	switch (nr) {
-	case __NR_newfstatat:
-		c = &cnt_nfstatat;
-		break;
-	case __NR_fstat:
-		/* fstat(fd, statbuf): the buffer is args[1], not args[2]. */
-		c = &cnt_nfstat;
-		break;
-	case __NR_statx:
-		c = &cnt_statx;
-		break;
-	case COMPAT_FSTATAT64_NR:
-		c = &cnt_fstatat64;
-		break;
-	case COMPAT_STAT64_NR:
-		c = &cnt_stat64;
-		break;
-	case COMPAT_LSTAT64_NR:
-		c = &cnt_lstat64;
-		break;
-	case COMPAT_FSTAT64_NR:
-		c = &cnt_fstat64;
-		break;
-	default:
+	/* ---- stat family: number -> counters -> argument positions ----
+	 * Gated on the ABI for the same reason as the listing numbers above: on arm64 the native
+	 * table's 195/196/197 are shmctl/shmat/shmdt, and shmat's second argument is a mapped
+	 * address - read as a compat struct stat64 buffer it would hand back whatever the caller
+	 * happens to have there, and on a rule hit rewrite it. */
+	if (compat) {
+		switch (nr) {
+		case COMPAT_FSTATAT64_NR:
+			c = &cnt_fstatat64;
+			break;
+		case COMPAT_STAT64_NR:
+			c = &cnt_stat64;
+			break;
+		case COMPAT_LSTAT64_NR:
+			c = &cnt_lstat64;
+			break;
+		case COMPAT_FSTAT64_NR:
+			c = &cnt_fstat64;
+			break;
+		default:
+			c = NULL;
+			break;
+		}
+	} else {
+		switch (nr) {
+		case __NR_newfstatat:
+			c = &cnt_nfstatat;
+			break;
+		case __NR_fstat:
+			/* fstat(fd, statbuf): the buffer is args[1], not args[2]. */
+			c = &cnt_nfstat;
+			break;
+		case __NR_statx:
+			c = &cnt_statx;
+			break;
+		default:
+			c = NULL;
+			break;
+		}
+	}
 
-		if ((nr >= KSTAT_NR_SCAN_LO && nr <= KSTAT_NR_SCAN_HI) ||
-		    nr == KSTAT_NR_GETDENTS64)
+	if (!c) {
+		/* A listing number cannot reach this point any more: the gate at the top of this
+		 * function answers both getdents ABIs before the stat switch, so only the stat
+		 * range is worth noting here. */
+		if (nr >= KSTAT_NR_SCAN_LO && nr <= KSTAT_NR_SCAN_HI)
 			kstat_note_unlisted(nr);
 		return;
 	}
@@ -985,9 +1011,12 @@ static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 	atomic_inc(&c->calls);
 
 	st.cnt = c;
-	st.compat = (nr == COMPAT_FSTATAT64_NR || nr == COMPAT_STAT64_NR ||
-		     nr == COMPAT_LSTAT64_NR || nr == COMPAT_FSTAT64_NR);
+	st.compat = compat;	/* the ABI that selected the number above */
 
+	/* Argument positions differ per number, so this stays a number switch - but only numbers
+	 * the gate above selected for THIS ABI can reach it, and the two ABIs' number sets
+	 * (79/80/291 native, 195/196/197/327 compat) do not overlap, so it needs no gate of its
+	 * own. */
 	switch (nr) {
 	case __NR_newfstatat:
 		syscall_get_arguments(current, regs, args);

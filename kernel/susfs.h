@@ -23,7 +23,10 @@ int sus_path_add_self_hidden(const char *path);
 
 int sus_path_del_path(const char *path);
 
-long sus_path_dirent_filter(long syscall_nr, unsigned long buf, long ret);
+/* -1 when this syscall number, for a task running that ABI, is not a directory listing. */
+int sus_path_dirent_layout_id(long syscall_nr, bool compat);
+
+long sus_path_dirent_filter(int lay_id, unsigned long buf, long ret);
 
 int sus_path_dirent_stat_line(char *buf, size_t size);
 
