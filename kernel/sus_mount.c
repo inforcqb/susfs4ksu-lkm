@@ -88,7 +88,7 @@
  *     identity-matched mount learns its id into the same id -> shown-id mapping, so
  *     fdinfo/statx keep naming a mount line the caller can still see.
  *
- * Known blind spots of the scan (see AUDIT_FINDINGS.md B10):
+ * Known blind spots of the scan:
  *   - overlayfs mounts that KernelSU places on /system have d_path "/system"
  *     and mnt_devname "overlay", so they are NOT recognised; only intercepting
  *     vfs_create_mount()/clone_mnt() by su domain (upstream's group (1)) would
@@ -168,7 +168,7 @@ static int n_show_probes;
 static unsigned long param_min_mnt_id = DEFAULT_KSU_MNT_ID;
 module_param_named(min_mnt_id, param_min_mnt_id, ulong, 0644);
 
-/* P2-12: SELinux context of the su/ksu domain, resolved to a sid at init.  Keep in sync
+/* SELinux context of the su/ksu domain, resolved to a sid at init.  Keep in sync
  * with susfs_avc_spoof.c's avc_su_ctx ("u:r:ksu:s0", the SukiSU variant; stock KernelSU
  * is "u:r:su:s0", override with susfs_guard_lkm.su_ctx=u:r:su:s0). */
 static char param_su_ctx[128] = "u:r:ksu:s0";
@@ -1217,7 +1217,7 @@ static int sus_mount_show_pre(struct kprobe *kp, struct pt_regs *regs)
                     r->mnt.mnt_root, r->mnt_devname ? r->mnt_devname : "none");
         return 0;
     }
-    /* P2-12 domain gate, upstream patch:1561-1585: the su/ksu domain is not
+    /* domain gate, upstream patch:1561-1585: the su/ksu domain is not
      * touched at all, it must be able to see its own mounts. */
     if (sus_mount_is_su_domain())
         return 0;
@@ -1774,7 +1774,7 @@ static int sus_mount_mark_ksu_mounts(void)
         return -ENOENT;
     }
 
-    /* P3: clamp the tunable (a value of 0/1 would match every mount line). */
+    /* clamp the tunable (a value of 0/1 would match every mount line). */
     if (param_min_mnt_id < SUS_MOUNT_MIN_SANE_MNT_ID) {
         pr_warn("sus_mount: min_mnt_id=%lu is below %d, clamping to %llu\n",
                 param_min_mnt_id, SUS_MOUNT_MIN_SANE_MNT_ID, DEFAULT_KSU_MNT_ID);

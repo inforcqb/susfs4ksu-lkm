@@ -318,8 +318,8 @@ static u64 emit_stat(char *out, u64 pos, const char *label, const char *path)
 }
 
 /* /proc/self/map_files/<start>-<end> is a symlink per mapping, and resolving it
- * names the mapped file - which is how the a4 tests located a mapping the maps
- * listing had already dropped.  Count the entries, how many of them still NAME
+ * names the mapped file - which is how a mapping the maps listing had already
+ * dropped is still located.  Count the entries, how many of them still NAME
  * the file this tool mapped, and how many answer ENOENT (the disguise). */
 struct linux_dirent64_min {
 	u64 d_ino;

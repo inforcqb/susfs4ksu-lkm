@@ -2060,7 +2060,8 @@ int sus_path_init(void)
     /* The DAC probes, the syscall-entry kprobes and the path-string probes are DELETED, not
      * merely disabled: the mode relax in sus_path_relax_mode() covers the case where DAC
      * answers EACCES before any LSM hook runs, and a hook that cannot fire reads as coverage.
-     * Their history, including the FPAC panic one of them caused, is in TECHNICAL_NOTES.md. */
+     * One of them also caused an FPAC panic, which is why they are not restored in
+     * their former shape. */
 
     /* The control node goes up LAST, and only when the layer that hides it is really installed
      * (susfs_control_node_allowed()): a 0777 world-writable node without the thing that answers

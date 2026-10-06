@@ -36,12 +36,10 @@ t_*.sh
 t_*.ps1
 art/
 
-# internal working documents: audit findings, subagent reports, implementation
-# notes.  Publishing them would describe exactly how the module hides itself and
-# what it is checked against - the opposite of the point.  They stay on disk.
+# Documents that are not needed to build or use the module are kept out of the tree:
+# only README.md and PROC_INTERFACES.md are published.
 *.md
 !README.md
-# 接口文档是要给使用者的，与 README 同级发布；其余 *.md 仍是内部文档（会写清隐藏手法本身）。
 !PROC_INTERFACES.md
 
 # development-only scaffolding: the probe/test modules and C test programs used

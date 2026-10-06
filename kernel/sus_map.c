@@ -96,7 +96,7 @@ static bool sus_map_lookup(unsigned long ino, dev_t dev)
  * = (test_thread_flag(TIF_PROC_UMOUNTED) && current_uid().val >= 10000): apps only, so
  * root/init see the real mapping.  TIF_PROC_UMOUNTED cannot be reproduced in this LKM
  * (KernelSU sets it only with the SUSFS integration compiled into the kernel, which this
- * device's kernel is not - AUDIT_FINDINGS.md), so uid >= 10000 is the project-wide proxy,
+ * device's kernel is not), so uid >= 10000 is the project-wide proxy,
  * as in susfs_kstat_gate_ok() (susfs_kstat.c, commit 543b369) and sus_path.
  * Configuration stays ungated: the supercall and map_ino are rule management. */
 static bool sus_map_gate_ok(void)
@@ -115,10 +115,10 @@ static bool sus_map_gate_ok(void)
  * instead of a vma, and the function ignores its v argument.  Measured with the probe
  * registered: `cat /proc/<pid>/smaps_rollup` as an app took vma->vm_file at 0xa0 -> ldr
  * from 0xa1 -> "Unable to handle kernel NULL pointer dereference at virtual address
- * 00000000000000a1", pc sus_map_skip_vma_pre+0x3c, then a panic (last_kmsg 41346.347).
+ * 00000000000000a1", pc sus_map_skip_vma_pre+0x3c, then a panic (uptime 41346.347).
  * Unreachable from a kprobe too: upstream skips the vma *inside* the rollup loop, and
  * smap_gather_stats() is inlined by LTO here (absent from /proc/kallsyms), so only
- * walk_page_range() could be intercepted.  TECHNICAL_NOTES.md, "sus_map 与 smaps_rollup". */
+ * walk_page_range() could be intercepted. */
 static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)
 {
     struct vm_area_struct *vma;
@@ -508,13 +508,12 @@ static int sus_map_vm_access_pre(struct kprobe *kp, struct pt_regs *regs)
 /* ---- /proc/<pid>/map_files/<start>-<end> ----
  *
  * Each entry is a symlink to the file mapped at that range, so `ls -l` and readlink name a
- * sus_map-registered file outright - measured: this is how the a4 tests found the address of
- * a mapping the maps listing had already dropped, i.e. this listing undid the hiding.
+ * sus_map-registered file outright - measured: this is how the address of a mapping the maps
+ * listing had already dropped was still reachable, i.e. this listing undid the hiding.
  * Upstream skips the entry in proc_map_files_readdir() (patch:1088-1095); a kprobe cannot
  * skip one entry of a readdir (the decision is a local in the middle of that function), so
  * the symlink still exists but resolving it answers ENOENT - what a checker gets for a file
- * that is not there.  The residual difference (the range is still listed) is in
- * TECHNICAL_NOTES.md.
+ * that is not there.  The residual difference is that the range itself is still listed.
  *
  * The first attempt hooked `proc_map_files_get_link` (the i_op): it registered fine and was
  * never called.  From this kernel's fs/proc/base.c - do_readlinkat() calls i_op->readlink

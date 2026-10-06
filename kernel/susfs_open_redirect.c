@@ -108,7 +108,7 @@ static DEFINE_MUTEX(or_lock);
 
 /* Reverse-disguise bookkeeping.  The counters are the only way to tell a hook that never fires from one that fires and
  * matches nothing: a kprobe registers against a symbol's out-of-line copy, which GKI's full LTO may leave with no live
- * call sites (AUDIT_FINDINGS.md: five probes registered, zero hits). */
+ * call sites (measured: five probes registered, zero hits). */
 static atomic_t or_rev_dpath_hits = ATOMIC_INIT(0);
 static atomic_t or_rev_statfs_hits = ATOMIC_INIT(0);
 
@@ -154,7 +154,7 @@ static __nocfi bool or_in_su_domain(void)
 
 /* Upstream's reverse-disguise gate, verbatim in shape: SUSFS_IS_INODE_OPEN_REDIRECT (susfs_def.h:148-151) = flag bit AND
  * susfs_is_current_proc_umounted_app().  TIF_PROC_UMOUNTED is never set on this kernel (no SUSFS integration in it, and
- * nothing calls ksu_handle_setresuid - AUDIT_FINDINGS.md), so uid >= 10000 is the proxy, as in sus_path / sus_kstat. */
+ * nothing calls ksu_handle_setresuid), so uid >= 10000 is the proxy, as in sus_path / sus_kstat. */
 static bool or_reverse_visible(void)
 {
 	return current_uid().val >= OR_APP_UID_MIN;
