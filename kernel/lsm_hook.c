@@ -246,33 +246,88 @@ static bool ksu_lsm_name_is(const char *name, const char *want)
     return name[n] == '\0' || name[n] == '.';
 }
 
+/* Is @fn one of the addresses kallsyms has for @name?
+ *
+ * The identity test cannot lean on the name kallsyms reports for an ADDRESS.  A lookup by
+ * address names one symbol per address, so when two functions end up at the same address
+ * (identical code folded together, or a vendor alias) that name is whichever symbol comes
+ * first - and it can be the other one.  Measured on a 6.12.23 vendor kernel: the address
+ * SELinux registered for inode_getattr resolves to `selinux_current_getsecid_subj`, which
+ * is a symbol at that very address; the slot was right, the reported name was not, and the
+ * module refused to load over it.
+ *
+ * So the question is asked the other way round: does kallsyms have ANY address called
+ * @name that equals this pointer?  @n_addrs receives how many addresses the name has at
+ * all, so a caller can log "this kernel has no such name" rather than "it is another name".
+ * The enumeration is the same one the multi-match fdinfo probe uses. */
+static bool ksu_lsm_addr_is_named(void *fn, const char *name, int *n_addrs)
+{
+    unsigned long addrs[8];
+    int n, i;
+
+    n = ksu_find_symbol_all(name, addrs, (int)ARRAY_SIZE(addrs));
+    if (n_addrs)
+        *n_addrs = n;
+
+    for (i = 0; i < n; i++) {
+        if (addrs[i] == (unsigned long)fn)
+            return true;
+    }
+
+    return false;
+}
+
 static int ksu_lsm_fn_is_selinux_hook(void *fn, const char *member, void *expect)
 {
     char buf[KSYM_SYMBOL_LEN];
     char want[64];
     char *mod = NULL;
-    int len;
+    int len, n_addrs = 0;
 
     snprintf(want, sizeof(want), "selinux_%s", member);
 
     len = ksu_symbol_name_of((unsigned long)fn, buf, &mod);
-    if (len > 0) {
-        if (!mod && ksu_lsm_name_is(buf, want))
+
+    /* The name of the address, when it is SELinux's own symbol (a module-owned one is
+     * somebody else's function and is refused below whatever it is called). */
+    if (len > 0 && !mod) {
+        if (ksu_lsm_name_is(buf, want))
             return 0;
-        if (!mod && strstr(buf, member)) {
+        if (strstr(buf, member)) {
             pr_warn("lsm_hook: %s: %px is not %s but its name contains it (%s) - accepting\n",
                     member, fn, want, buf);
             return 0;
         }
-        if (mod)
-            pr_warn("lsm_hook: %s: %px resolves to %s [%s], which is neither %s nor contains \"%s\"\n",
-                    member, fn, buf, mod, want, member);
-        else
-            pr_warn("lsm_hook: %s: %px resolves to %s, which is neither %s nor contains \"%s\"\n",
-                    member, fn, buf, want, member);
+    }
+
+    /* The address itself, when it is one kallsyms has for the name we want.  This is what
+     * covers the folded/aliased case above, and it is still a real identity check: the name
+     * has to resolve to this exact pointer. */
+    if (!mod && ksu_lsm_addr_is_named(fn, want, &n_addrs)) {
+        pr_warn("lsm_hook: %s: %px is %s by address - kallsyms names that address %s; accepting\n",
+                member, fn, want, buf[0] ? buf : "(nothing)");
+        return 0;
+    }
+
+    if (mod) {
+        pr_warn("lsm_hook: %s: %px resolves to %s [%s], which is neither %s nor contains \"%s\"\n",
+                member, fn, buf, mod, want, member);
         return -EINVAL;
     }
 
+    if (len > 0) {
+        pr_warn("lsm_hook: %s: %px resolves to %s, which is neither %s nor contains \"%s\" (%d address(es) are named %s, none of them this one)\n",
+                member, fn, buf, want, member, n_addrs, want);
+        return -EINVAL;
+    }
+
+    if (n_addrs == 0)
+        pr_warn("lsm_hook: %s: %px cannot be named, and this kernel has no address named %s at all\n",
+                member, fn, want);
+
+    /* Nothing named that address, so the identity of the name could not be checked above -
+     * this is the path this function has always had: compare against the address resolved
+     * for `selinux_<member>`, and with nothing to compare against, refuse. */
     if (expect)
         return (fn == expect) ? 0 : -EINVAL;
 
