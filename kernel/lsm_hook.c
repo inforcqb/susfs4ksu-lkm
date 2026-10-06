@@ -105,17 +105,94 @@ static int ksu_lsm_hook_patch_slot(void **slot, void *value)
  * below; our node is writable and becomes reachable only once head->first is patched, so
  * no walk can observe a half-initialised node. */
 
-/* Locate the list head for hook->head_name and cross-check it: the address is
+/* How many entries of a list are looked at while identifying it; a list is short and this only
+ * bounds the walk. */
+#define KSU_LSM_HEAD_SCAN_ENTRIES	64
+
+/* Find the list head for @hook by IDENTITY instead of by the build-time offset.
+ *
+ * offsetof(struct security_hook_heads, member) is only this hook's list when the kernel's hook
+ * order matches the tree this module was compiled against - and the offset-based cross-check
+ * below cannot tell the difference: it compares first->head with the address it computed, and a
+ * list belonging to ANOTHER hook reports exactly that value, because its entries were linked to
+ * it.  Inserting the replacement into the wrong list means the kernel calls it with another
+ * hook's prototype, which under kCFI is a panic at best.  Measured on 6.12.23-android16: the
+ * table offset landed on a different hook there entirely (see the technical notes).
+ *
+ * What identifies a list is which implementation of `selinux_<member>` its entries hold: resolve
+ * that name to its addresses (kallsyms, normally one) and take the first head whose list contains
+ * an entry holding one of them.  Returns -ENOENT when nothing matches; the caller then falls back
+ * to the computed offset, which is what every kernel that works today relies on. */
+static int ksu_lsm_hook_head_by_identity(unsigned long heads_addr, struct ksu_lsm_hook *hook,
+                                        struct hlist_head **out)
+{
+    unsigned long addrs[8];
+    char want[64];
+    int n_addrs, i;
+    unsigned long off;
+
+    snprintf(want, sizeof(want), "selinux_%s", hook->head_name);
+    n_addrs = ksu_find_symbol_all(want, addrs, (int)ARRAY_SIZE(addrs));
+    if (!n_addrs)
+        return -ENOENT;
+
+    for (off = 0; off + sizeof(struct hlist_head) <= sizeof(struct security_hook_heads);
+         off += sizeof(struct hlist_head)) {
+        struct hlist_head *head = (struct hlist_head *)(heads_addr + off);
+        struct security_hook_list *e =
+            hlist_entry_safe(READ_ONCE(head->first), struct security_hook_list, list);
+        int seen = 0;
+
+        for (; e && seen < KSU_LSM_HEAD_SCAN_ENTRIES; seen++) {
+            void *fn = *(void **)((char *)e + hook->hook_offset);
+
+            for (i = 0; i < n_addrs; i++) {
+                if (fn == (void *)addrs[i]) {
+                    *out = head;
+                    return 0;
+                }
+            }
+            e = hlist_entry_safe(READ_ONCE(e->list.next), struct security_hook_list, list);
+        }
+    }
+
+    return -ENOENT;
+}
+
+/* Locate the list head for hook->head_name: by identity first (above), then - and only then - by
  * offsetof(struct security_hook_heads, member), a __randomize_layout struct (RANDSTRUCT is off in
- * every GKI build this module targets), so LSM_HOOK_INIT's entry->head verifies that the first
- * entry at that address points back at it.  A wrong offset would otherwise patch an hlist_head no
- * call site walks - a hook silently never called, which reads like a working layer in every
- * counter - hence a mismatch fails the load, and an empty head is -ENOENT (as in replace). */
+ * every GKI build this module targets).  The offset path also cross-checks that the first entry at
+ * that address points back at it, and an offset that lands on no list is -ENOENT (as in replace);
+ * what it cannot see is an offset that lands on ANOTHER hook's list, which is why identity goes
+ * first and says so when the two disagree. */
 static int ksu_lsm_hook_head_at(unsigned long heads_addr, struct ksu_lsm_hook *hook,
                                 struct hlist_head **out)
 {
     struct hlist_head *head;
     struct security_hook_list *first;
+
+    if (ksu_lsm_hook_head_by_identity(heads_addr, hook, &head) == 0) {
+        first = hlist_entry_safe(READ_ONCE(head->first), struct security_hook_list, list);
+        if (first && first->head != head) {
+            pr_err("lsm_hook: %s: identified head %px but its first entry reports %px - refusing\n",
+                    hook->head_name ?: "unknown", head, first->head);
+            return -EINVAL;
+        }
+        if ((unsigned long)head != heads_addr + hook->head_offset) {
+            pr_warn("lsm_hook: %s: its list is at offset %#lx of security_hook_heads while offsetof() names %#lx - this kernel's hook order differs from the tree this module was built against\n",
+                    hook->head_name ?: "unknown",
+                    (unsigned long)((char *)head - (char *)heads_addr),
+                    (unsigned long)hook->head_offset);
+        }
+        SUSFS_LOGI("lsm_hook: %s: list head found by identity at offset %#lx\n",
+                hook->head_name ?: "unknown",
+                (unsigned long)((char *)head - (char *)heads_addr));
+        *out = head;
+        return 0;
+    }
+
+    pr_warn("lsm_hook: %s: no list in security_hook_heads holds this hook's selinux_%s implementation (name not in kallsyms, or renamed) - falling back to the offsetof() slot, unverified\n",
+            hook->head_name ?: "unknown", hook->head_name);
 
     if (hook->head_offset + sizeof(struct hlist_head) > sizeof(struct security_hook_heads)) {
         pr_err("lsm_hook: %s: head offset %#lx is outside security_hook_heads\n",
