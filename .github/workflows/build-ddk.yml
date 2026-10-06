@@ -230,6 +230,38 @@ jobs:
             exit 1
           fi
 
+      # A checked indirect call into the KERNEL is a panic, not an error return: the compiler
+      # instruments the call site, the kernel compares the callee's type id against the one
+      # the caller expected, and for this module the two do not agree - measured on a 5.15
+      # device, where the first call through a runtime-resolved pointer died with
+      # "Kernel panic - not syncing: CFI failure (target: kallsyms_on_each_symbol+0x0/0x1e4)".
+      # Every call through a resolved pointer therefore has to sit inside a __nocfi function.
+      #
+      # Source review cannot assert that: LTO re-instruments a `static __nocfi` helper that
+      # was inlined into a caller without the attribute, which is exactly how that panic
+      # ended up inside susfs_sus_mount_supercall().  So the assertion is made on the
+      # ARTIFACT, by tools/cfi_sites.py - a relocation against the CFI runtime entry point
+      # (5.10/5.15: LLVM CFI with .cfi_jt) and, from 6.1 on, the KCFI check sequence itself
+      # (`ldur Wt, [Xn, #-4]` of the callee's type id plus cmp plus the `brk` trap), because
+      # KCFI's mismatch path is a trap and relocates nothing.
+      - name: CFI call-site gate (an instrumented indirect call must stay module-local)
+        run: |
+          set -e
+          f=kernel/susfs_guard_lkm.ko
+          # Allow-list: calls through MODULE-local function tables only.  There the compiler
+          # emitted both the call site and the callee, so the type ids agree by construction:
+          #   init_module / susfs_layers_down - the susfs_layers[] init/exit table
+          #   susfs_tw_func                   - the supercall command table
+          # (The CFI runtime's own __cfi_check is filtered by the tool, not listed here.)
+          ALLOW="init_module,susfs_layers_down,susfs_tw_func"
+          if command -v python3 >/dev/null 2>&1; then PY=python3
+          elif command -v python >/dev/null 2>&1; then PY=python
+          else
+            echo "::error::no python interpreter in this image, so the CFI call-site gate cannot run - failing rather than skipping, because a silently skipped check is how the panic above reached a release"
+            exit 1
+          fi
+          "$PY" tools/cfi_sites.py --allow "$ALLOW" "$f"
+
       # The dirent layer probes a syscall entry point BY NAME (kernel/sus_path.c:
       # sus_dirent_candidates[]), and which of those names survives is a property of the
       # BUILD, not of the source: __arm64_sys_* is referenced by the syscall table and so

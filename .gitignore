@@ -58,5 +58,10 @@ kernel/ih_hook_stub.S
 # namespace-probe helper used by t_clonens.sh
 nsprobe.sh
 
+# byte-compiled python: tools/cfi_sites.py is run by CI and by hand, and CPython leaves
+# __pycache__ next to it
+__pycache__/
+*.pyc
+
 # local scratch: downloaded CI artifacts, device scripts and CI logs used while verifying
 dist/
