@@ -14,6 +14,7 @@
 #include <linux/uaccess.h>
 #include <linux/string.h>
 #include <linux/cred.h>	/* current_uid(), control-node gate */
+#include <linux/version.h>	/* LINUX_VERSION_CODE: slow_avc_audit() lost its leading `state` in 6.4 */
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
@@ -30,8 +31,18 @@ static u32 avc_priv_app_sid;
 static bool avc_spoof_enabled;
 static bool avc_registered;
 
-/* slow_avc_audit(state, ssid, tsid, tclass, requested, audited, denied, result, a): tsid is arg #3
- * (regs->regs[2]), a u32 in the low bits.  avc_audit_post_callback is static and LTO-inlined into
+/* slow_avc_audit(ssid, tsid, tclass, requested, audited, denied, result, a) - tsid is arg #2
+ * (regs->regs[1]), a u32 in the low bits.
+ *
+ * UP TO v6.3 the prototype had a leading `struct selinux_state *state`, so tsid sat in arg #3
+ * (regs->regs[2]).  v6.4 dropped that argument and everything shifted down by one: reading
+ * regs->regs[2] on 6.4+ would read **tclass** (a small 1..~100 class number) instead of the
+ * target sid, so no audit ever matched and the spoof silently did nothing - and in the one
+ * case where a tclass could equal the su sid, the write-back below would clobber the tclass
+ * argument instead, which audit then indexes secclass_map[] with.  Gate on the version, and
+ * read and write the SAME argument.
+ *
+ * avc_audit_post_callback is static and LTO-inlined into
  * slow_avc_audit (noinline), so its kallsyms symbol is a leftover; slow_avc_audit has a real out-of-line copy.
  * This handler runs in interrupt context (no sleep), so it only rewrites the register. */
 static atomic_t avc_hit_count = ATOMIC_INIT(0);
@@ -39,7 +50,11 @@ static atomic_t avc_enter_count = ATOMIC_INIT(0);
 
 static int avc_audit_post_pre(struct kprobe *kp, struct pt_regs *regs)
 {
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+	u32 tsid = (u32)regs->regs[1];
+#else
 	u32 tsid = (u32)regs->regs[2];
+#endif
 
 	atomic_inc(&avc_enter_count);
 	/* avc_su_sid == 0 means security_secctx_to_secid() failed (see init); a failed resolution must not
@@ -47,7 +62,11 @@ static int avc_audit_post_pre(struct kprobe *kp, struct pt_regs *regs)
 	if (!avc_su_sid || tsid != avc_su_sid)
 		return 0;
 	atomic_inc(&avc_hit_count);
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
+	regs->regs[1] = avc_priv_app_sid;
+#else
 	regs->regs[2] = avc_priv_app_sid;
+#endif
 	return 0;
 }
 
