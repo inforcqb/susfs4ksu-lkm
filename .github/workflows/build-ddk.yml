@@ -199,11 +199,14 @@ jobs:
           # modpost emits CRCs (and srcversion, module_layout) only when Module.symvers carries them, and this DDK tree's
           # __versions is empty - so check_version() finds no entry for ANY imported symbol and load-time version checking
           # does not happen: "it loads" is not evidence that the KMI matches.  Warns rather than fails for exactly that reason.
+          # Field 6 is Size (field 7 is ES) and readelf prints it zero-padded ("000000"), so the old
+          # "${vs:-0}" = "0" term compared the padding and could never match.  The size stays in the printout
+          # for the record; the warning keys off the two unambiguous signals instead.
           vs=$(readelf -SW "$f" | awk '/\] __versions/ {print $6}')
           sv=$(readelf -p .modinfo "$f" | grep -c 'srcversion=' || true)
           ml=$(nm -u "$f" | grep -c 'module_layout' || true)
           echo "__versions size=${vs:-?} srcversion=${sv} module_layout=${ml}"
-          if [ "${vs:-0}" = "0" ] || [ "${sv:-0}" = "0" ] || [ "${ml:-0}" = "0" ]; then
+          if [ "${sv:-0}" = "0" ] || [ "${ml:-0}" = "0" ]; then
             echo "::warning::no symbol CRCs in this build tree: load-time version checks are inert (Module.symvers has no CRC entries)"
           fi
 
