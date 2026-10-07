@@ -670,21 +670,58 @@ static void susfs_kstat_spoof_compat_statbuf(unsigned long statbuf)
 }
 
 /* sys_exit tracepoint: the user statbuf is fully written by now, and syscall_get_arguments()
- * still returns the original args (verified: args[2] == statbuf), so no per-cpu state is needed. */
+ * still returns the original args (verified: args[2] == statbuf), so no per-cpu state is needed.
+ *
+ * It carries two features: the stat family below, and sus_path's directory-listing rewrite.  The
+ * listing side needs its own gate - see the note above sus_path_dirent_layout_id(): a syscall
+ * number alone does not identify a call (arm64's native 141 is getpriority where AArch32 numbers
+ * getdents 141), so the number is only ever read together with the caller's ABI.
+ *
+ * COST: this callback runs for every syscall exit, so the three checks below (is_compat_task(),
+ * syscall_get_nr(), the classifier) are paid on all of them - a function call and a couple of
+ * compares.  The callback itself was measured when the stat family moved onto it at ~28 ns per
+ * syscall (getpid 113 -> 141 ns); that number is the baseline this adds to, and it has not been
+ * re-measured for the listing filter (no device was available for this change).
+ *
+ * KNOWN BOUNDARY (ptrace): arch/arm64/kernel/syscall.c writes regs->syscallno = scno BEFORE
+ * syscall_trace_enter(), so a tracer that rewrites a getdents64 into another syscall still gets
+ * classified here as getdents64; the parse then fails on a buffer that is not a dirent chain and
+ * counts a rewrite failure.  It cannot corrupt anything (every read is bounded by d_reclen and
+ * every failure answers "nothing filtered"), and the stat family below has the same exposure. */
 static void kstat_sys_exit(void *data, struct pt_regs *regs, long ret)
 {
 	unsigned long args[6];
-	long nr;
+	bool compat = is_compat_task();
+	long nr = syscall_get_nr(current, regs);
+	int lay = sus_path_dirent_layout_id(nr, compat);
+
+	if (lay >= 0) {
+		long rc;
+
+		/* Nothing to rewrite when the syscall produced no bytes (an error, or the end of
+		 * the directory), and the arguments must not be read before the gate said this
+		 * really is a listing call.  The same goes for the armed flag: with no rules yet
+		 * (or with no_extra) there is nothing to do, and that is the common case. */
+		if (ret <= 0 || !sus_path_dirent_armed())
+			return;
+		syscall_get_arguments(current, regs, args);
+		rc = sus_path_dirent_filter(lay,
+					    compat ? (unsigned long)compat_ptr((u32)args[1])
+						   : args[1],
+					    ret);
+		if (rc != ret)
+			syscall_set_return_value(current, regs, 0, rc);
+		return;
+	}
 
 	if (ret != 0)
 		return;
 	syscall_get_arguments(current, regs, args);
-	nr = syscall_get_nr(current, regs);
 
 	/* The statbuf argument is NOT the same one for every syscall, so the NULL check has to live
 	 * inside each branch: fstat64(fd, statbuf) keeps it in args[1], and checking args[2] first
 	 * made every 32-bit fstat64() return early - the rule applied to fstatat64, not to fstat64. */
-	if (is_compat_task()) {
+	if (compat) {
 		switch (nr) {
 		case COMPAT_FSTATAT64_NR:
 			susfs_kstat_spoof_compat_statbuf((unsigned long)compat_ptr((u32)args[2]));
@@ -1115,6 +1152,14 @@ static struct proc_dir_entry *kstat_proc_entry;
 
 static bool kstat_tp_registered;
 static bool kstat_krp_registered;
+
+/* sus_path's listing filter rides this tracepoint but does not register it (the stat family
+ * here does), so it has to be able to tell whether the ride exists: with the registration
+ * failed, the filter would be silently dead while sus_path still reported itself armed. */
+bool susfs_kstat_tracepoint_armed(void)
+{
+	return READ_ONCE(kstat_tp_registered);
+}
 
 int susfs_kstat_init(void)
 {

@@ -202,13 +202,12 @@ static void show(const char *what, long rc)
 /* ---- the two listing ABIs an AArch32 caller can use ----
  *
  * This is why a 32-bit client is needed for more than stat: the AArch32 table has
- * getdents64 (217) pointing at the NATIVE sys_getdents64 - so the 64-bit probe
- * already covers it - and a SEPARATE getdents (141) whose body has its own record
- * layout.  Upstream calls that body __do_compat_sys_getdents
- * (COMPAT_SYSCALL_DEFINE3 in fs/readdir.c); the module does NOT probe that name any
- * more - it is `static inline` with a single caller and can be inlined away - it
- * arms the __arm64_compat_sys_getdents wrapper and takes the buffer out of the
- * caller's pt_regs (see the candidate list in kernel/sus_path.c).  The two layouts:
+ * getdents64 (217) pointing at the NATIVE sys_getdents64 - so the 64-bit path already
+ * covers it - and a SEPARATE getdents (141) whose body has its own record layout.
+ * Upstream calls that body __do_compat_sys_getdents (COMPAT_SYSCALL_DEFINE3 in
+ * fs/readdir.c).  The module names neither body: it rides the shared sys_exit
+ * tracepoint and decides by (syscall number, caller ABI), so both numbers reach it
+ * from here.  The two layouts:
  *
  *   getdents64: struct linux_dirent64      { u64 ino; s64 off; u16 reclen; u8 type; char name[]; }
  *               -> reclen at +16, name at +19

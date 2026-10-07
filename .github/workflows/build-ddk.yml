@@ -262,20 +262,16 @@ jobs:
           fi
           "$PY" tools/cfi_sites.py --allow "$ALLOW" "$f"
 
-      # The dirent layer probes a syscall entry point BY NAME (kernel/sus_path.c:
-      # sus_dirent_candidates[]), and which of those names survives is a property of the
-      # BUILD, not of the source: __arm64_sys_* is referenced by the syscall table and so
-      # always exists, while __do_*/__se_* are `static inline`/`static` with a single caller
-      # and can be inlined away (measured on a 6.1 device: __do_sys_getdents64 and
-      # __do_compat_sys_getdents were both gone, kallsyms_lookup_name() found neither, and
-      # the listing filter was never armed there).
+      # The module's undefined symbols are what the loaders absolutize from kallsyms before
+      # init_module(2), so every one of them has to exist in the tree a variant is built against.
+      # If this variant's DDK tree ships a built image or a symbol map, that is checkable here,
+      # before anyone loads anything.  If it ships neither - which is the case for a headers-only
+      # DDK image - this step cannot say anything at all and says so out loud, instead of passing
+      # silently as if it had verified something.
       #
-      # The module now tries the wrapper first, so what has to hold at runtime is that the
-      # WRAPPER exists.  If this variant's DDK tree ships a built image or a symbol map, that
-      # is checkable here, before anyone loads anything.  If it ships neither - which is the
-      # case for a headers-only DDK image - this step cannot say anything at all and says so
-      # out loud, instead of passing silently as if it had verified something.
-      - name: Check the getdents probe symbols in the DDK tree (best effort)
+      # The dirent filter needs no symbol of its own: it rides the shared sys_exit tracepoint and
+      # decides by (syscall number, caller ABI), so nothing here asserts a getdents name.
+      - name: Check the built .ko's undefined symbols in the DDK tree (best effort)
         run: |
           set -e
           V="${{ matrix.variant }}"
@@ -284,7 +280,7 @@ jobs:
             if [ -n "$d" ] && { [ -f "$d/vmlinux" ] || [ -f "$d/System.map" ]; }; then S="$d"; break; fi
           done
           if [ -z "$S" ]; then
-            echo "no vmlinux/System.map in the DDK image: the getdents symbol check AND the undefined-symbol loader gate are both SKIPPED for $V - that is a gap in this variant's evidence, not a pass"
+            echo "no vmlinux/System.map in the DDK image: the undefined-symbol loader gate is SKIPPED for $V - that is a gap in this variant's evidence, not a pass"
             exit 0
           fi
           echo "=== symbol source: $S ==="
@@ -305,30 +301,6 @@ jobs:
             fi
             echo "${_n:-0}"
           }
-
-          # Informational: the whole candidate list, so a variant's log shows which of the
-          # three fallbacks would have been available as well.
-          echo "--- candidates from kernel/sus_path.c (informational) ---"
-          for s in __arm64_sys_getdents64 __do_sys_getdents64 __se_sys_getdents64 \
-                   __arm64_compat_sys_getdents __do_compat_sys_getdents __se_compat_sys_getdents; do
-            printf '  %-32s %s\n' "$s" "$(sym_count "$s")"
-          done
-
-          # Hard error: the two names the module arms FIRST and therefore depends on at
-          # runtime.  Without them the dirent layer is dead on this variant and a hidden
-          # entry shows up in every listing.
-          echo "--- asserted ---"
-          fail=0
-          for s in __arm64_sys_getdents64 __arm64_compat_sys_getdents; do
-            n=$(sym_count "$s")
-            printf '  %-32s %s\n' "$s" "$n"
-            if [ "$n" = "0" ]; then
-              echo "::error::$s is not in $S (variant $V) - this is the getdents wrapper the LKM arms first (kernel/sus_path.c: sus_dirent_candidates[]); without it the dirent filter cannot arm on this variant"
-              fail=1
-            fi
-          done
-          [ "$fail" = "0" ] || exit 1
-          echo "both getdents wrapper symbols present in $S"
 
           # ---- loader gate: every undefined symbol of the built .ko must be a name this
           # tree's kallsyms has.
@@ -369,9 +341,9 @@ jobs:
       # (kernel/symbol_resolver.c: find_kernel_symbol_exact + the kprobe bootstrap).  Those never
       # appear in the .ko's undefined list, so the loader gate above cannot see them - and a name
       # that moved, was renamed, or was inlined away in ONE tree silently disables that feature on
-      # that variant only.  Measured on android14-6.1: `__do_sys_getdents64` and
-      # `__do_compat_sys_getdents` are gone there while the wrappers stay, which is exactly why the
-      # dirent layer probes the wrapper first.  This step prints the DDK tree's own answer for every
+      # that variant only.  Measured on android14-6.1: `seq_show` is four symbols there and one on
+      # 5.10/5.15, which is the kind of difference this step exists to make visible per variant.
+      # This step prints the DDK tree's own answer for every
       # by-name lookup the module makes, per variant.  The three show_* callbacks are a hard error
       # (without them /proc/mounts and /proc/self/mountinfo are not filtered at all, i.e. the mount
       # layer is off on that variant); everything else is reported, because the module degrades
@@ -424,9 +396,7 @@ jobs:
                    security_hook_heads set_memory_ro set_memory_rw set_memory_x \
                    aarch64_insn_patch_text text_poke module_alloc \
                    smaps_walk_ops smaps_shmem_walk_ops pagemap_ops \
-                   dcache_clean_inval_poc caches_clean_inval_pou __flush_dcache_area \
-                   __arm64_sys_getdents64 __arm64_compat_sys_getdents \
-                   __do_sys_getdents64 __do_compat_sys_getdents; do
+                   dcache_clean_inval_poc caches_clean_inval_pou __flush_dcache_area; do
             n=$(sym_count "$s"); printf '  %-34s %s\n' "$s" "$n"
             if [ "$n" = "0" ]; then
               echo "::warning::$s is not in $S (variant $V) - the feature that resolves it by name cannot arm on this kernel"

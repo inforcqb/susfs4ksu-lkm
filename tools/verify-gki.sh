@@ -12,7 +12,7 @@
 #   * did the 13 hooks land as the FIRST node of their lists, ahead of SELinux
 #   * do they actually run (counters move on a non-root probe)
 #   * is a registered entry absent from a LISTING as well, not just from stat() - the name
-#     layer is a separate kretprobe and it died silently on 6.1 while stat() kept answering
+#     layer is a hook of its own and it died silently on 6.1 while stat() kept answering
 #     ENOENT, so the two layers are checked separately
 #   * is everything they hide still hidden, and is an ordinary rule still app-only
 #   * does anything alarm across unload/reload cycles
@@ -212,9 +212,10 @@ if [ "$HAVE_SU" = "1" ]; then
     # The LSM slots answer stat()/open(); they cannot touch a listing, because the
     # directory chain is built inside the filesystem and no per-entry callback is
     # reachable from a module.  A listing therefore tests the OTHER layer - and that is
-    # the layer that died silently on 6.1, where its kretprobe symbol (__do_sys_getdents64)
-    # had been inlined away: every registered entry kept appearing in every listing while
-    # stat() still answered ENOENT.  That combination is exactly what this section catches.
+    # the layer that has died silently before (on 6.1, where the symbol it hooked,
+    # __do_sys_getdents64, had been inlined away): every registered entry kept appearing in
+    # every listing while stat() still answered ENOENT.  That combination is exactly what
+    # this section catches.
     #
     # Judged on a NAMED entry, never on "the output was empty": the directory holds the
     # registered entry AND an unregistered neighbour, and the neighbour has to still be

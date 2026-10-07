@@ -26,6 +26,20 @@ static inline bool susfs_abi_path_ok(const char *field, size_t size)
 /* Add a path to sus_path's hidden set from kernel code (no supercall needed); returns 0 or negative errno. */
 int sus_path_add_hidden(const char *path);
 
+/* The listing filter, driven from the shared sys_exit tracepoint in susfs_kstat.c: which layout a
+ * syscall number denotes for a task running the given ABI (-1 when it is not a listing call), the
+ * rewrite itself, and whether it is armed at all (it is armed on the first rule, and not at all
+ * with no_extra).  Split in three so the caller can answer all of that before it touches the
+ * arguments.  The stat family in susfs_kstat.c has its own is_compat_task() gate of the same
+ * shape; it does not call these. */
+bool sus_path_dirent_armed(void);
+int sus_path_dirent_layout_id(long syscall_nr, bool compat);
+long sus_path_dirent_filter(int lay_id, unsigned long buf, long ret);
+
+/* Whether the shared sys_exit tracepoint (registered by the stat family) is up.  sus_path's
+ * listing filter rides it but does not own it, so it needs the answer for its own report. */
+bool susfs_kstat_tracepoint_armed(void);
+
 /* Same, for one of this module's own control nodes: flagged so the gate hides it from EVERY non-root caller, not merely
  * from apps (uid>=10000) - otherwise a probe running as system (1000) or shell (2000) reads the node name out of /proc. */
 int sus_path_add_self_hidden(const char *path);
