@@ -2,50 +2,34 @@
 
 /* Refuse to load when the imported symbol addresses were not filled in.
  *
- * Every symbol this module imports is a strong SHN_UNDEF entry, and the kernel cannot resolve
- * most of them: they are not in its export table (saved_boot_config, init_mm, ...) or they are
- * namespaced (kern_path, ihold, ...).  They arrive resolved only when
- * the image is rewritten before it reaches the kernel - `ksud insmod` and the bundled
- * susfs_insmod walk the symbol table and turn each SHN_UNDEF into SHN_ABS with the address
- * kallsyms has for that name.
+ * Every symbol this module imports is a strong SHN_UNDEF entry, and the kernel does not export all
+ * of them (a plain `insmod` left eight of 95 unresolved on the device measured here), so the image
+ * is normally absolutized before it reaches the kernel: `ksud insmod` and the bundled susfs_insmod
+ * turn each SHN_UNDEF into SHN_ABS with the address kallsyms has for that name.
  *
- * A plain `insmod` therefore fails on the first unresolvable name (which is fine - it never
- * runs).  The case worth defending against is a loader that cannot find a name and continues
- * with the value it had, i.e. zero.  Whether the loader then notices depends on how the name is
- * reached, so the table below covers three classes (measured per artifact, by aggregating every
- * relocation that targets an imported name):
+ * The case worth defending against is a loader that cannot find a name and continues with the value
+ * it had, i.e. zero.  Whether the loader notices depends on how the name is reached, so the table
+ * below covers three classes (measured per artifact, by aggregating every relocation that targets an
+ * imported name):
  *
- *   - Page-address names, six of the 53: saved_boot_config, init_mm, memstart_addr,
- *     arm64_use_ng_mappings, __tracepoint_sys_exit, kmalloc_caches.  Their value sits inside an
- *     ADR_PREL_PG_HI21 sequence, so on the kernels measured here a zero overflows that relocation
- *     and the loader refuses the image (-ENOEXEC, "overflow in relocation type 275 val 0").  Not a
- *     guarantee: a CPU that needs the A53 erratum 843419 workaround can get an ADRP veneer
- *     pointing at the symbol instead, which accepts the zero.
- *   - Branch-only names: 43 of the 53 in the LLVM-CFI builds (5.10/5.15), 39 in the kCFI builds
- *     (6.1+).  A zero here is NOT necessarily refused - the loader can answer an out-of-range
- *     CALL26/JUMP26 with a PLT entry for the symbol instead of refusing the image, and then it
- *     loads.  Whether that happens is a property of the kernel, not of this table, so on the
- *     kernels measured here treat "the loader will refuse it" as false for this class.
- *   - Pointer-only names, referenced by R_AARCH64_ABS64 alone: param_ops_bool/int/string/ulong on
- *     every variant, plus single_release, seq_read, seq_lseek and delayed_work_timer_fn in the
- *     kCFI builds (the first three are proc_ops callbacks, in the seven struct proc_ops objects
- *     this module registers; the fourth is sus_path_pending_wq's timer).  The loader takes a zero
- *     here without complaining.
+ *   - page-address names (ADR_PREL_PG_HI21, six of the 53): a zero overflows the relocation and the
+ *     loader refuses the image on the kernels measured here - unless the CPU needs the A53 erratum
+ *     843419 workaround, which gets an ADRP veneer pointing at the symbol instead;
+ *   - branch-reached names, whose only PC-relative references are branches (43 of the 53 in the
+ *     LLVM-CFI builds, 39 in the kCFI builds): a zero is NOT necessarily refused, because the loader
+ *     can answer an out-of-range branch with a PLT entry for the symbol instead, so the floor check
+ *     below is what has to catch it - and in the LLVM-CFI builds it cannot, because &name for a
+ *     function is a module-local stub there;
+ *   - pointer-only names, referenced by R_AARCH64_ABS64 alone: the loader takes a zero without
+ *     complaining.  For param_ops_* that is fatal beyond repair - the kernel frees a module whose
+ *     init failed through destroy_params(), which reads params->ops->free without testing ops for
+ *     NULL (measured: Oops at +0x18 of struct kernel_param_ops) - while for a zeroed struct proc_ops
+ *     or delayed_work pointer a refusal simply fails the load.
  *
- * For the last two classes the floor check below is what has to stop the load, with one caveat it
- * cannot fix: in the LLVM-CFI builds &name for a function is a module-local stub, so the 43
- * branch-only entries are invisible to it (see the floor check's own comment).  For param_ops_* a
- * refusal comes too late anyway: the kernel frees a module whose init returned non-zero through
- * free_module() -> destroy_params(), which reads params->ops->free without testing ops for NULL
- * (measured on a 5.15 GKI build: Oops at +0x18 of struct kernel_param_ops, and a reboot where
- * panic_on_oops is set).  Loading without refusing is no better - reading or writing the
- * parameter, and unloading the module, take the same NULL ops path.  Refusing a zeroed struct
- * proc_ops or delayed_work pointer has no such problem: that load simply fails.
- *
- * So: check that every import below has a plausible kernel address before anything else in
- * init runs.  In the kCFI builds that covers the whole table; in the LLVM-CFI builds only the ten
- * data entries, so for the branch-only function imports the loaders and the build-time assertion
- * of every import against the target kernel's System.map are the real defence.
+ * So: check that every import below has a plausible kernel address before anything else in init
+ * runs.  In the kCFI builds that covers the whole table; in the LLVM-CFI builds only the ten data
+ * entries, so for the branch-reached function imports the loaders and the build-time assertion of
+ * every import against the target kernel's System.map are the real defence.
  * Only names present in every variant's import list are listed here - a name a variant does not
  * import would turn this guard itself into a new unresolved symbol. */
 
@@ -90,8 +74,8 @@ struct susfs_import {
     /* Whether &name is the address the loader wrote into the symbol.  It is for data symbols.
      * For functions it is not, on the LLVM-CFI builds (5.10/5.15): there &f in a data initializer
      * resolves to a module-local long-branch stub, so only the objects below are cross-checked.
-     * The kCFI builds (6.1/6.6) resolve &f to the loader's address for all 53 entries, so the same
-     * check could cover them too; it stays off until a 6.1/6.6 device confirms it, because a wrong
+     * The kCFI builds (6.1+) resolve &f to the loader's address for all 53 entries, so the same
+     * check could cover them too; it stays off until a kCFI device confirms it, because a wrong
      * comparison here refuses a good load. */
     bool compare;
 };

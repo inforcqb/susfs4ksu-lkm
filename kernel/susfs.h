@@ -30,9 +30,11 @@ static inline bool susfs_abi_path_ok(const char *field, size_t size)
  * refusal cannot prevent the panic that follows - it only puts the reason in the log first. */
 int susfs_imports_guard(void);
 
-/* Second half of the same check, called once the symbol resolver is up: every import whose name
- * kallsyms has exactly once must hold that address, so an image absolutized from the wrong symbol
- * table (a stale kallsyms, or the wrong occurrence of a duplicate name) is refused as well.
+/* Second half of the same check, called once the symbol resolver is up: every import flagged
+ * compare - the ten data imports, see imports_guard.c - whose name kallsyms has exactly once must
+ * hold that address, so an image absolutized from the wrong symbol table (a stale kallsyms, or the
+ * wrong occurrence of a duplicate name) is refused as well.  The function imports are not compared:
+ * in the LLVM-CFI builds &name is a module-local stub there.
  * The definition carries __nocfi (it calls into the kernel through the resolver's function
  * pointers); the attribute belongs on the definition, so it is not repeated here. */
 int susfs_imports_crosscheck(void);
