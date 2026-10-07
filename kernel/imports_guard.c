@@ -19,25 +19,32 @@
  *     LLVM-CFI builds (5.10/5.15) and 45 in the kCFI builds (6.1+).  Within that class, six carry
  *     the value inside a page-address sequence (ADR_PREL_PG_HI21): saved_boot_config, init_mm,
  *     memstart_addr, arm64_use_ng_mappings, __tracepoint_sys_exit, kmalloc_caches.  Zeroing one of
- *     THOSE overflows its relocation and the kernel refuses the image (-ENOEXEC, "overflow in
- *     relocation type 275 val 0" - measured, 275 is ADR_PREL_PG_HI21).
+ *     THOSE overflows its relocation and the kernels measured here refuse the image (-ENOEXEC,
+ *     "overflow in relocation type 275 val 0" - 275 is ADR_PREL_PG_HI21).  Not a guarantee: on a
+ *     CPU that needs the A53 erratum 843419 workaround, reloc_insn_adrp() may patch the ADRP into
+ *     an ADR or emit an ADRP veneer pointing at the symbol, which accepts the zero as well.
  *   - The other 43 (5.10/5.15) and 39 (6.1+) of that class are reached by branches only, and a
- *     zero there is NOT necessarily refused: these builds carry CONFIG_ARM64_MODULE_PLTS (the
- *     .plt sections are in the artifacts), and arch/arm64's module loader answers an out-of-range
- *     branch relocation by emitting a PLT entry whose target is the symbol value - i.e. zero -
- *     and retrying.  Whether a slot was reserved for it is a CONFIG_RANDOMIZE_BASE matter, so
- *     treat "the kernel will refuse it" as false for this class.
+ *     zero there is NOT necessarily refused: arch/arm64's module loader answers an out-of-range
+ *     branch relocation by emitting a PLT entry whose target is the symbol value - i.e. zero - and
+ *     retrying.  From 6.6 on that support is unconditional (CONFIG_ARM64_MODULE_PLTS was folded
+ *     away, and module_frob_arch_sections() always reserves the slots); on 5.10/5.15/6.1 it is
+ *     selected by CONFIG_RANDOMIZE_BASE, and the .plt sections are in the artifacts only then.
+ *     Whether a slot was reserved for a call relocation is the same CONFIG_RANDOMIZE_BASE matter
+ *     (count_plts(), partition_branch_plt_relas()), so treat "the kernel will refuse it" as false
+ *     for this class.
  *   - The rest are reached only through function or data pointers and are referenced by
  *     R_AARCH64_ABS64 alone, so the kernel accepts a zero in silence: param_ops_bool/int/string/
  *     ulong, plus single_release, seq_read, seq_lseek and delayed_work_timer_fn on the kCFI
- *     builds.  The floor check below is the only line of defence for those - and for the four
+ *     builds (the first three are proc_ops callbacks, in the seven struct proc_ops objects this
+ *     module registers; the fourth is sus_path_pending_wq's timer).  The floor check below is the
+ *     only line of defence for those - and for the four
  *     param_ops_* it is a weak one, because no check in this module can undo the damage: the
  *     kernel frees a module whose init returned non-zero through free_module() ->
  *     destroy_params(), which reads params->ops->free without testing ops for NULL (measured on a
  *     5.15 GKI build: Oops at +0x18 of struct kernel_param_ops, and a reboot where panic_on_oops
  *     is set).  Loading without refusing is no better - reading or writing the parameter, and
- *     unloading the module, take the same NULL ops path.  Refusing a zeroed pointer out of
- *     file_operations / seq_operations / delayed_work has no such problem: that load simply fails.
+ *     unloading the module, take the same NULL ops path.  Refusing a zeroed struct proc_ops or
+ *     delayed_work pointer has no such problem: that load simply fails.
  *
  * So: check that every import below has a plausible kernel address before anything else in
  * init runs.  On the kCFI builds that covers the whole table; on the LLVM-CFI builds it covers the
@@ -190,10 +197,11 @@ int susfs_imports_guard(void)
     if (!bad)
         return 0;
 
-    pr_err("susfs_guard_lkm: %u of %u imported symbol(s) have no kernel address (%s%s%s%s) - this image was not absolutized before init_module(). Load it with `ksud insmod` or the bundled `susfs_insmod`, not with a plain `insmod` (or with a loader that continues after an unresolved name): the kernel accepts a zero address here without complaining, and the first call through it jumps to 0. Refusing to load (module version %s).\n",
+    pr_err("susfs_guard_lkm: %u of %u imported symbol(s) have no kernel address (%s%s%s%s%s%s) - this image was not absolutized before init_module(). Load it with `ksud insmod` or the bundled `susfs_insmod`, not with a plain `insmod` (or with a loader that continues after an unresolved name): the kernel accepts a zero address here without complaining, and the first call through it jumps to 0. Refusing to load (module version %s).\n",
            bad, (unsigned int)ARRAY_SIZE(susfs_imports), first ? first : "?",
-           second ? ", " : "", second ? second : "", third ? ", ..." : "",
-           SUSFS_LKM_VERSION);
+           second ? ", " : "", second ? second : "",
+           third ? ", " : "", third ? third : "",
+           bad > 3 ? ", ..." : "", SUSFS_LKM_VERSION);
     if (ops_missing)
         pr_err("susfs_guard_lkm: note: the names include a param_ops_*, so refusing is not enough to keep this load attempt alive - the kernel frees this module through destroy_params(), which reads ops->free with a NULL ops, and faults. This message is the reason that fault is coming.\n");
     return -EINVAL;
@@ -243,9 +251,10 @@ int __nocfi susfs_imports_crosscheck(void)
     }
 
     if (skipped)
-        pr_warn("susfs_guard_lkm: %u import(s) were not cross-checked (%s%s%s%s): this kernel's kallsyms has no such name, lists it more than once, or the resolver is not up\n",
+        pr_warn("susfs_guard_lkm: %u import(s) were not cross-checked (%s%s%s%s%s%s): this kernel's kallsyms has no such name, lists it more than once, or the resolver is not up\n",
                 skipped, skipped1 ? skipped1 : "?", skipped2 ? ", " : "",
-                skipped2 ? skipped2 : "", skipped3 ? ", ..." : "");
+                skipped2 ? skipped2 : "", skipped3 ? ", " : "", skipped3 ? skipped3 : "",
+                skipped > 3 ? ", ..." : "");
 
     if (!bad)
         return 0;
