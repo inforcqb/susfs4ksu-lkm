@@ -11,48 +11,41 @@
  *
  * A plain `insmod` therefore fails on the first unresolvable name (which is fine - it never
  * runs).  The case worth defending against is a loader that cannot find a name and continues
- * with the value it had, i.e. zero.  Whether the kernel then notices depends on how the name is
+ * with the value it had, i.e. zero.  Whether the loader then notices depends on how the name is
  * reached, so the table below covers three classes (measured per artifact, by aggregating every
  * relocation that targets an imported name):
  *
- *   - 49 of the 53 names are reached by module code through a PC-relative relocation in the
- *     LLVM-CFI builds (5.10/5.15) and 45 in the kCFI builds (6.1+).  Within that class, six carry
- *     the value inside a page-address sequence (ADR_PREL_PG_HI21): saved_boot_config, init_mm,
- *     memstart_addr, arm64_use_ng_mappings, __tracepoint_sys_exit, kmalloc_caches.  Zeroing one of
- *     THOSE overflows its relocation and the kernels measured here refuse the image (-ENOEXEC,
- *     "overflow in relocation type 275 val 0" - 275 is ADR_PREL_PG_HI21).  Not a guarantee: on a
- *     CPU that needs the A53 erratum 843419 workaround, reloc_insn_adrp() may patch the ADRP into
- *     an ADR or emit an ADRP veneer pointing at the symbol, which accepts the zero as well.
- *   - The other 43 (5.10/5.15) and 39 (6.1+) of that class are reached by branches only, and a
- *     zero there is NOT necessarily refused: arch/arm64's module loader answers an out-of-range
- *     branch relocation by emitting a PLT entry whose target is the symbol value - i.e. zero - and
- *     retrying.  From 6.6 on that support is unconditional (CONFIG_ARM64_MODULE_PLTS was folded
- *     away, and module_frob_arch_sections() always reserves the slots); on 5.10/5.15/6.1 it is
- *     selected by CONFIG_RANDOMIZE_BASE, and the .plt sections are in the artifacts only then.
- *     Whether a slot was reserved for a call relocation is the same CONFIG_RANDOMIZE_BASE matter
- *     (count_plts(), partition_branch_plt_relas()), so treat "the kernel will refuse it" as false
- *     for this class.
- *   - The rest are reached only through function or data pointers and are referenced by
- *     R_AARCH64_ABS64 alone, so the kernel accepts a zero in silence: param_ops_bool/int/string/
- *     ulong, plus single_release, seq_read, seq_lseek and delayed_work_timer_fn on the kCFI
- *     builds (the first three are proc_ops callbacks, in the seven struct proc_ops objects this
- *     module registers; the fourth is sus_path_pending_wq's timer).  The floor check below is the
- *     only line of defence for those - and for the four
- *     param_ops_* it is a weak one, because no check in this module can undo the damage: the
- *     kernel frees a module whose init returned non-zero through free_module() ->
- *     destroy_params(), which reads params->ops->free without testing ops for NULL (measured on a
- *     5.15 GKI build: Oops at +0x18 of struct kernel_param_ops, and a reboot where panic_on_oops
- *     is set).  Loading without refusing is no better - reading or writing the parameter, and
- *     unloading the module, take the same NULL ops path.  Refusing a zeroed struct proc_ops or
- *     delayed_work pointer has no such problem: that load simply fails.
+ *   - Page-address names, six of the 53: saved_boot_config, init_mm, memstart_addr,
+ *     arm64_use_ng_mappings, __tracepoint_sys_exit, kmalloc_caches.  Their value sits inside an
+ *     ADR_PREL_PG_HI21 sequence, so on the kernels measured here a zero overflows that relocation
+ *     and the loader refuses the image (-ENOEXEC, "overflow in relocation type 275 val 0").  Not a
+ *     guarantee: a CPU that needs the A53 erratum 843419 workaround can get an ADRP veneer
+ *     pointing at the symbol instead, which accepts the zero.
+ *   - Branch-only names: 43 of the 53 in the LLVM-CFI builds (5.10/5.15), 39 in the kCFI builds
+ *     (6.1+).  A zero here is NOT necessarily refused - an out-of-range CALL26/JUMP26 can be
+ *     answered with a PLT entry whose target is the symbol, i.e. zero, and then the image loads.
+ *     Whether that happens is a property of the kernel, not of this table, so on the kernels
+ *     measured here treat "the loader will refuse it" as false for this class.
+ *   - Pointer-only names, referenced by R_AARCH64_ABS64 alone: param_ops_bool/int/string/ulong on
+ *     every variant, plus single_release, seq_read, seq_lseek and delayed_work_timer_fn in the
+ *     kCFI builds (the first three are proc_ops callbacks, in the seven struct proc_ops objects
+ *     this module registers; the fourth is sus_path_pending_wq's timer).  The loader takes a zero
+ *     here without complaining.
+ *
+ * For the last two classes the floor check below is what has to stop the load, with one caveat it
+ * cannot fix: in the LLVM-CFI builds &name for a function is a module-local stub, so the 43
+ * branch-only entries are invisible to it (see the floor check's own comment).  For param_ops_* a
+ * refusal comes too late anyway: the kernel frees a module whose init returned non-zero through
+ * free_module() -> destroy_params(), which reads params->ops->free without testing ops for NULL
+ * (measured on a 5.15 GKI build: Oops at +0x18 of struct kernel_param_ops, and a reboot where
+ * panic_on_oops is set).  Loading without refusing is no better - reading or writing the
+ * parameter, and unloading the module, take the same NULL ops path.  Refusing a zeroed struct
+ * proc_ops or delayed_work pointer has no such problem: that load simply fails.
  *
  * So: check that every import below has a plausible kernel address before anything else in
- * init runs.  On the kCFI builds that covers the whole table; on the LLVM-CFI builds it covers the
- * ten data entries, because &name for a function is a module-local stub there (see the floor check
- * below) - and for those 43 the kernel may accept a zero, which leaves a hole this check cannot
- * close, so the loaders and the build-time assertion of every import against the target kernel's
- * System.map stay the real defence.  For the param_ops_* case the check can only name the cause in
- * the log before the kernel faults; for every other name it is what stops the load.
+ * init runs.  In the kCFI builds that covers the whole table; in the LLVM-CFI builds only the ten
+ * data entries, so for the branch-only function imports the loaders and the build-time assertion
+ * of every import against the target kernel's System.map are the real defence.
  * Only names present in every variant's import list are listed here - a name a variant does not
  * import would turn this guard itself into a new unresolved symbol. */
 
