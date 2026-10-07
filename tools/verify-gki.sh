@@ -199,13 +199,29 @@ if [ "$HAVE_SU" = "1" ]; then
     o2=$(nonroot "stat -c %n $TMPF"); r2=$?
     o3=$(stat -c %n $TMPF); r3=$?
     info "uid 10000 rc=$r1 '$o1' | uid 2000 rc=$r2 '$o2' | root rc=$r3 '$o3'"
-    [ $r1 -ne 0 ] && ok "uid 10000 gets ENOENT" || bad "uid 10000 can still see the rule target"
+    # Judged the way deny_ok() does it, for the same reason: a non-zero status alone is not
+    # ENOENT.  "Permission denied" means the path is still visible and something else refused
+    # it - the leak this module exists to avoid - so it must not be reported as a pass.
+    if [ $r1 -eq 0 ]; then
+        bad "uid 10000 can still see the rule target"
+    elif echo "$o1" | grep -qi 'permission denied'; then
+        bad "uid 10000 got EACCES - '$TMPF' is visible and refused by DAC/SELinux, not hidden ($o1)"
+    else
+        ok "uid 10000 gets ENOENT"
+    fi
     [ $r2 -eq 0 ] && ok "uid 2000 still sees it (the gate is an app gate)" || bad "uid 2000 was denied - the gate changed"
     [ $r3 -eq 0 ] && ok "root still sees it" || bad "root was denied"
     echo "del $TMPF" > /proc/susfs_path
     sleep 1
-    o=$(app "stat -c %n $TMPF")
-    [ -n "$o" ] && ok "after del, uid 10000 sees it again" || bad "after del, uid 10000 still gets ENOENT"
+    # rc and the printed name, never "the output was non-empty": app() folds stderr into stdout
+    # (deny_ok() relies on that), so a refusal would satisfy a bare [ -n "$o" ] and this check
+    # could not fail.
+    o=$(app "stat -c %n $TMPF"); r=$?
+    if [ $r -eq 0 ] && [ "$o" = "$TMPF" ]; then
+        ok "after del, uid 10000 sees it again"
+    else
+        bad "after del, uid 10000 still gets ENOENT (rc=$r '$o')"
+    fi
     rm -f "$TMPF"
 
     sec "5b. the dirent (name) layer: a registered entry is not in a listing either"
