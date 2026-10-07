@@ -942,6 +942,17 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		return -EINVAL;
 	}
 
+	/* Capacity is checked before the rewrite retires anything: with a full table, failing after the
+	 * WRITE_ONCE(e->dead, true) below would return -ENOSPC *and* silently kill the redirection that
+	 * was working.  A retired slot is never reused either: reuse would overwrite path fields a reader
+	 * may still hold and discard the reference the dead entry owns.  Rules are configuration, so the
+	 * array growing is fine. */
+	if (nor >= SUS_OR_MAX) {
+		path_put(&rp);
+		path_put(&tp);
+		return -ENOSPC;
+	}
+
 	if (e) {
 		/* Rewriting a rule: mark the old entry dead and leave its paths alone - they stay for the module's life and
 		 * unload releases each entry exactly once.  or_del() says why those fields must not be cleared while a reader
@@ -951,13 +962,6 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		e = NULL;
 	}
 
-	/* A retired slot is never reused either: reuse would overwrite path fields a reader may still hold and discard the
-	 * reference the dead entry owns.  Rules are configuration, so the array growing is fine. */
-	if (nor >= SUS_OR_MAX) {
-		path_put(&rp);
-		path_put(&tp);
-		return -ENOSPC;
-	}
 	e = &or_entries[nor++];
 	/* Take the slot, then mark it "not published" before a single field lands in it.  The
 	 * array is static, so a never-used slot already has dead == false - which means the
