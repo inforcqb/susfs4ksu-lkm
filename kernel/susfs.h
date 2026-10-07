@@ -25,7 +25,9 @@ static inline bool susfs_abi_path_ok(const char *field, size_t size)
 
 /* Refuse to load when this image's imported symbol addresses are not kernel addresses, i.e. when
  * the loader that put it in did not absolutize them.  Returns 0 when they are all filled in, -EINVAL
- * otherwise (and prints which ones are missing).  Called first in susfs_init(). */
+ * otherwise (and prints which ones are missing).  Called first in susfs_init().  How much of the
+ * table that really covers depends on the variant (see imports_guard.c), and for param_ops_* a
+ * refusal cannot prevent the panic that follows - it only puts the reason in the log first. */
 int susfs_imports_guard(void);
 
 /* Second half of the same check, called once the symbol resolver is up: every import whose name

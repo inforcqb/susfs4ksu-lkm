@@ -11,13 +11,26 @@
  *
  * A plain `insmod` therefore fails on the first unresolvable name (which is fine - it never
  * runs).  The case worth defending against is a loader that cannot find a name and continues
- * with the value it had, i.e. zero: the kernel accepts SHN_ABS/0 without a word, and the first
- * call through that symbol jumps to address 0.  Nothing about that is visible from userspace
- * until it panics.
+ * with the value it had, i.e. zero.  What the kernel does with that zero decides whether this
+ * guard can help:
+ *
+ *   - A name module code reaches through a PC-relative relocation overflows that relocation when
+ *     zeroed, so the kernel refuses the image itself (-ENOEXEC, "overflow in relocation type 275
+ *     val 0") before init_module() is reached.  Nothing to catch.
+ *   - The four param_ops_* names are referenced only by R_AARCH64_ABS64, so a zero is accepted in
+ *     silence - and then it is fatal in a way no check in this module can undo: the kernel frees
+ *     a module whose init returned non-zero through free_module() -> destroy_params(), which
+ *     reads params->ops->free without testing ops for NULL (measured on a 5.15 GKI build: Oops at
+ *     +0x18 of struct kernel_param_ops, and a reboot where panic_on_oops is set).  Loading
+ *     without refusing is not better - reading or writing the parameter, and unloading the
+ *     module, take the same NULL ops path.
  *
  * So: check that every import below has a plausible kernel address before anything else in
- * init runs.  Only names present in every variant's import list are listed here - a name a
- * variant does not import would turn this guard itself into a new unresolved symbol. */
+ * init runs.  For those four the check can only name the cause in the log before the kernel
+ * faults; what keeps them filled is the loaders, plus the build-time assertion of every import
+ * against the target kernel's System.map.
+ * Only names present in every variant's import list are listed here - a name a variant does not
+ * import would turn this guard itself into a new unresolved symbol. */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
@@ -57,9 +70,12 @@ extern char *saved_boot_config;
 struct susfs_import {
     const char *name;
     const void *addr;
-    /* Whether &name is the address the loader wrote into the symbol.  It is for data symbols,
-     * and it is NOT for functions: there, &f in a data initializer resolves to a module-local
-     * stub, which is why only the objects below are cross-checked against kallsyms. */
+    /* Whether &name is the address the loader wrote into the symbol.  It is for data symbols.
+     * For functions it is not, on the LLVM-CFI builds (5.10/5.15): there &f in a data initializer
+     * resolves to a module-local long-branch stub, so only the objects below are cross-checked.
+     * The kCFI builds (6.1/6.6) resolve &f to the loader's address for all 53 entries, so the same
+     * check could cover them too; it stays off until a 6.1/6.6 device confirms it, because a wrong
+     * comparison here refuses a good load. */
     bool compare;
 };
 
@@ -126,12 +142,16 @@ static const struct susfs_import susfs_imports[] = {
 };
 
 /* arm64 user and kernel space cannot overlap: every kernel text/data/vmalloc address on a
- * GKI build sits far above this, and a zero-filled or user-space value sits below it. */
+ * GKI build sits far above this, and a zero-filled or user-space value sits below it.
+ * How much of the table this really covers depends on the variant: the 43 function entries hold a
+ * module-local stub address in the LLVM-CFI builds (always above the floor, so only the 10 data
+ * entries are checked there), and the loader's address in the kCFI builds (all 53 are checked). */
 #define SUSFS_IMPORT_ADDR_MIN 0xff00000000000000UL
 
 int susfs_imports_guard(void)
 {
     unsigned int i, bad = 0;
+    bool ops_missing = false;
     const char *first = NULL, *second = NULL, *third = NULL;
 
     for (i = 0; i < ARRAY_SIZE(susfs_imports); i++) {
@@ -140,6 +160,8 @@ int susfs_imports_guard(void)
         if (a >= SUSFS_IMPORT_ADDR_MIN)
             continue;
         bad++;
+        if (!strncmp(susfs_imports[i].name, "param_ops_", 10))
+            ops_missing = true;
         if (!first)
             first = susfs_imports[i].name;
         else if (!second)
@@ -154,22 +176,22 @@ int susfs_imports_guard(void)
     pr_err("susfs_guard_lkm: %u of %u imported symbol(s) have no kernel address (%s%s%s%s) - this image was not absolutized before init_module(). Load it with `ksud insmod` or the bundled `susfs_insmod`, not with a plain `insmod` (or with a loader that continues after an unresolved name): the kernel accepts a zero address here without complaining, and the first call through it jumps to 0. Refusing to load.\n",
            bad, (unsigned int)ARRAY_SIZE(susfs_imports), first ? first : "?",
            second ? ", " : "", second ? second : "", third ? ", ..." : "");
+    if (ops_missing)
+        pr_err("susfs_guard_lkm: note: the names include a param_ops_*, so refusing is not enough to keep this load attempt alive - the kernel frees this module through destroy_params(), which reads ops->free with a NULL ops, and faults. This message is the reason that fault is coming.\n");
     return -EINVAL;
 }
 
-/* The second half, called once the symbol resolver is up.  The floor check above cannot fire on
- * arm64 in practice: an import left at zero is refused by the kernel's own relocation step before
- * init_module() returns (measured: an image with three imports zeroed comes back -ENOEXEC, and the
- * kernel says "overflow in relocation type 275 val 0"), so every image that LOADS has addresses.
- * What can load and still be wrong is a plausibly-valued address that belongs to the wrong symbol -
- * a stale kallsyms snapshot, or the wrong occurrence of a name that kallsyms lists more than once.
- * For the data symbols this comparison is exact (&name IS the address the loader wrote, measured:
- * patching init_mm to another kernel address shows up here as that address); for functions it is
- * not, because &f in a data initializer resolves to a module-local stub, so those are skipped. */
+/* The second half, called once the symbol resolver is up.  Every image that reaches init has been
+ * through the kernel's relocation step, but that only proves an address is non-zero, not that it is
+ * the right one.  What can load and still be wrong is a plausibly-valued address that belongs to
+ * the wrong symbol - a stale kallsyms snapshot, or the wrong occurrence of a name that kallsyms
+ * lists more than once.  For the data symbols this comparison is exact (&name IS the address the
+ * loader wrote, measured: patching init_mm to another kernel address shows up here as that
+ * address); for functions it is not - see the compare field above. */
 int susfs_imports_crosscheck(void)
 {
     unsigned long addrs[2];
-    unsigned int i, bad = 0;
+    unsigned int i, bad = 0, skipped = 0;
 
     for (i = 0; i < ARRAY_SIZE(susfs_imports); i++) {
         int n;
@@ -180,8 +202,10 @@ int susfs_imports_crosscheck(void)
 
         /* 0 = this kernel does not have the name (or the resolver could not be bootstrapped),
          * 2 = the name is ambiguous; in both cases there is nothing to compare against. */
-        if (n != 1)
+        if (n != 1) {
+            skipped++;
             continue;
+        }
         if (addrs[0] == (unsigned long)susfs_imports[i].addr)
             continue;
 
@@ -190,6 +214,10 @@ int susfs_imports_crosscheck(void)
             pr_err("susfs_guard_lkm: import %s = 0x%lx but kallsyms has 0x%lx\n",
                    susfs_imports[i].name, (unsigned long)susfs_imports[i].addr, addrs[0]);
     }
+
+    if (skipped)
+        pr_warn("susfs_guard_lkm: %u import(s) were not cross-checked: this kernel's kallsyms has no such name, lists it more than once, or the resolver is not up\n",
+                skipped);
 
     if (!bad)
         return 0;
