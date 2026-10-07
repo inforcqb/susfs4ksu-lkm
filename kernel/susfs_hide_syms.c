@@ -292,7 +292,7 @@ out:
 	return rc;
 }
 
-static int hide_modules_format(char *buf, size_t size)
+static int hide_modules_format_unlocked(char *buf, size_t size)
 {
 	int n = 0;
 	int i;
@@ -307,6 +307,22 @@ static int hide_modules_format(char *buf, size_t size)
 	for (i = 0; i < n_hide_modules && n < (int)size - 64; i++)
 		n += scnprintf(buf + n, size - n, " %s", hide_modules[i]);
 	n += scnprintf(buf + n, size - n, "\n");
+	return n;
+}
+
+/* The writer publishes under hide_modules_lock (hide_modules_commit() memsets the whole table
+ * and then memcpys the new one), so the reader has to hold the same lock: without it a reader
+ * could run between those two steps and print the name count of the new list with every name
+ * still zeroed.  Formatting under the lock is safe - scnprintf does not sleep - and it is what
+ * hide_module_name_match() already does on the kprobe side. */
+static int hide_modules_format(char *buf, size_t size)
+{
+	unsigned long flags;
+	int n;
+
+	spin_lock_irqsave(&hide_modules_lock, flags);
+	n = hide_modules_format_unlocked(buf, size);
+	spin_unlock_irqrestore(&hide_modules_lock, flags);
 	return n;
 }
 
