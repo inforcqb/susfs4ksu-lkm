@@ -180,9 +180,10 @@ int susfs_imports_guard(void)
     if (!bad)
         return 0;
 
-    pr_err("susfs_guard_lkm: %u of %u imported symbol(s) have no kernel address (%s%s%s%s) - this image was not absolutized before init_module(). Load it with `ksud insmod` or the bundled `susfs_insmod`, not with a plain `insmod` (or with a loader that continues after an unresolved name): the kernel accepts a zero address here without complaining, and the first call through it jumps to 0. Refusing to load.\n",
+    pr_err("susfs_guard_lkm: %u of %u imported symbol(s) have no kernel address (%s%s%s%s) - this image was not absolutized before init_module(). Load it with `ksud insmod` or the bundled `susfs_insmod`, not with a plain `insmod` (or with a loader that continues after an unresolved name): the kernel accepts a zero address here without complaining, and the first call through it jumps to 0. Refusing to load (module version %s).\n",
            bad, (unsigned int)ARRAY_SIZE(susfs_imports), first ? first : "?",
-           second ? ", " : "", second ? second : "", third ? ", ..." : "");
+           second ? ", " : "", second ? second : "", third ? ", ..." : "",
+           SUSFS_LKM_VERSION);
     if (ops_missing)
         pr_err("susfs_guard_lkm: note: the names include a param_ops_*, so refusing is not enough to keep this load attempt alive - the kernel frees this module through destroy_params(), which reads ops->free with a NULL ops, and faults. This message is the reason that fault is coming.\n");
     return -EINVAL;
@@ -194,11 +195,14 @@ int susfs_imports_guard(void)
  * the wrong symbol - a stale kallsyms snapshot, or the wrong occurrence of a name that kallsyms
  * lists more than once.  For the data symbols this comparison is exact (&name IS the address the
  * loader wrote, measured: patching init_mm to another kernel address shows up here as that
- * address); for functions it is not - see the compare field above. */
-int susfs_imports_crosscheck(void)
+ * address); for functions it is not - see the compare field above.  __nocfi because it calls into
+ * the kernel through the resolver's function pointers, and LTO is free to inline that body in
+ * here: the attribute has to sit on the function the call site ends up in. */
+int __nocfi susfs_imports_crosscheck(void)
 {
     unsigned long addrs[2];
     unsigned int i, bad = 0, skipped = 0;
+    const char *skipped1 = NULL, *skipped2 = NULL, *skipped3 = NULL;
 
     for (i = 0; i < ARRAY_SIZE(susfs_imports); i++) {
         int n;
@@ -211,6 +215,12 @@ int susfs_imports_crosscheck(void)
          * 2 = the name is ambiguous; in both cases there is nothing to compare against. */
         if (n != 1) {
             skipped++;
+            if (!skipped1)
+                skipped1 = susfs_imports[i].name;
+            else if (!skipped2)
+                skipped2 = susfs_imports[i].name;
+            else if (!skipped3)
+                skipped3 = susfs_imports[i].name;
             continue;
         }
         if (addrs[0] == (unsigned long)susfs_imports[i].addr)
@@ -223,8 +233,9 @@ int susfs_imports_crosscheck(void)
     }
 
     if (skipped)
-        pr_warn("susfs_guard_lkm: %u import(s) were not cross-checked: this kernel's kallsyms has no such name, lists it more than once, or the resolver is not up\n",
-                skipped);
+        pr_warn("susfs_guard_lkm: %u import(s) were not cross-checked (%s%s%s%s): this kernel's kallsyms has no such name, lists it more than once, or the resolver is not up\n",
+                skipped, skipped1 ? skipped1 : "?", skipped2 ? ", " : "",
+                skipped2 ? skipped2 : "", skipped3 ? ", ..." : "");
 
     if (!bad)
         return 0;

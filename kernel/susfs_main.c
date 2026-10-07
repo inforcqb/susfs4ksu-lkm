@@ -12,9 +12,10 @@
 #include "lsm_hook.h"
 #include "susfs.h"
 
-#define SUSFS_LKM_VERSION "2.3.0-gki"
 /* The module's own name lives in susfs.h (SUSFS_LKM_MODULE_NAME / SUSFS_LKM_SYSFS_DIR):
- * /sys/module's directory and the rules that hide it (susfs_hide_syms.c) must agree. */
+ * /sys/module's directory and the rules that hide it (susfs_hide_syms.c) must agree, and the
+ * version lives there as well (SUSFS_LKM_VERSION) because the load-time guard can refuse the
+ * module before this file's banner runs. */
 
 /* The /proc/susfs_* control nodes are created by default and are 0777 on purpose.
  * Measured on device, 0600 plus sus_path hiding does not work: `ls -l /proc/susfs_kstat`
