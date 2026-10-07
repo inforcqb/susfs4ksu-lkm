@@ -197,13 +197,13 @@ int susfs_imports_guard(void)
     if (!bad)
         return 0;
 
-    pr_err("susfs_guard_lkm: %u of %u imported symbol(s) have no kernel address (%s%s%s%s%s%s) - this image was not absolutized before init_module(). Load it with `ksud insmod` or the bundled `susfs_insmod`, not with a plain `insmod` (or with a loader that continues after an unresolved name): the kernel accepts a zero address here without complaining, and the first call through it jumps to 0. Refusing to load (module version %s).\n",
+    pr_err("%u of %u imported symbol(s) have no kernel address (%s%s%s%s%s%s) - this image was not absolutized before init_module(). Load it with `ksud insmod` or the bundled `susfs_insmod`, not with a plain `insmod` (or with a loader that continues after an unresolved name): the kernel accepts a zero address here without complaining, and the first call through it jumps to 0. Refusing to load (module version %s).\n",
            bad, (unsigned int)ARRAY_SIZE(susfs_imports), first ? first : "?",
            second ? ", " : "", second ? second : "",
            third ? ", " : "", third ? third : "",
            bad > 3 ? ", ..." : "", SUSFS_LKM_VERSION);
     if (ops_missing)
-        pr_err("susfs_guard_lkm: note: the names include a param_ops_*, so refusing is not enough to keep this load attempt alive - the kernel frees this module through destroy_params(), which reads ops->free with a NULL ops, and faults. This message is the reason that fault is coming.\n");
+        pr_err("note: the names include a param_ops_*, so refusing is not enough to keep this load attempt alive - the kernel frees this module through destroy_params(), which reads ops->free with a NULL ops, and faults. This message is the reason that fault is coming.\n");
     return -EINVAL;
 }
 
@@ -246,12 +246,12 @@ int __nocfi susfs_imports_crosscheck(void)
 
         bad++;
         if (bad <= 3)
-            pr_err("susfs_guard_lkm: import %s = 0x%lx but kallsyms has 0x%lx\n",
+            pr_err("import %s = 0x%lx but kallsyms has 0x%lx\n",
                    susfs_imports[i].name, (unsigned long)susfs_imports[i].addr, addrs[0]);
     }
 
     if (skipped)
-        pr_warn("susfs_guard_lkm: %u import(s) were not cross-checked (%s%s%s%s%s%s): this kernel's kallsyms has no such name, lists it more than once, or the resolver is not up\n",
+        pr_warn("%u import(s) were not cross-checked (%s%s%s%s%s%s): this kernel's kallsyms has no such name, lists it more than once, or the resolver is not up\n",
                 skipped, skipped1 ? skipped1 : "?", skipped2 ? ", " : "",
                 skipped2 ? skipped2 : "", skipped3 ? ", " : "", skipped3 ? skipped3 : "",
                 skipped > 3 ? ", ..." : "");
@@ -259,7 +259,7 @@ int __nocfi susfs_imports_crosscheck(void)
     if (!bad)
         return 0;
 
-    pr_err("susfs_guard_lkm: %u imported data symbol(s) do not match this kernel's kallsyms - the image was absolutized from the wrong symbol table (a stale /proc/kallsyms, or the wrong occurrence of a name that appears more than once). Load it with `ksud insmod` or the bundled `susfs_insmod` and reload; refusing to load.\n",
+    pr_err("%u imported data symbol(s) do not match this kernel's kallsyms - the image was absolutized from the wrong symbol table (a stale /proc/kallsyms, or the wrong occurrence of a name that appears more than once). Load it with `ksud insmod` or the bundled `susfs_insmod` and reload; refusing to load.\n",
            bad);
     return -EINVAL;
 }
