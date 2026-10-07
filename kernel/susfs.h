@@ -16,6 +16,22 @@ static inline bool susfs_abi_path_ok(const char *field, size_t size)
 	return strnlen(field, size) < size;
 }
 
+/* Refuse to load when this image's imported symbol addresses are not kernel addresses, i.e. when
+ * the loader that put it in did not absolutize them.  Returns 0 when they are all filled in, -EINVAL
+ * otherwise (and prints which ones are missing).  Called first in susfs_init().  How much of the
+ * table that really covers depends on the variant (see imports_guard.c), and for param_ops_* a
+ * refusal cannot prevent the panic that follows - it only puts the reason in the log first. */
+int susfs_imports_guard(void);
+
+/* Second half of the same check, called once the symbol resolver is up: every import flagged
+ * compare - the ten data imports, see imports_guard.c - whose name kallsyms has exactly once must
+ * hold that address, so an image absolutized from the wrong symbol table (a stale kallsyms, or the
+ * wrong occurrence of a duplicate name) is refused as well.  The function imports are not compared:
+ * in the LLVM-CFI builds &name is a module-local stub there.
+ * The definition carries __nocfi (it calls into the kernel through the resolver's function
+ * pointers); the attribute belongs on the definition, so it is not repeated here. */
+int susfs_imports_crosscheck(void);
+
 /* Add a path to sus_path's hidden set from kernel code (no supercall needed); returns 0 or negative errno. */
 int sus_path_add_hidden(const char *path);
 
@@ -32,6 +48,10 @@ int sus_path_dirent_stat_line(char *buf, size_t size);
 
 #define SUSFS_LKM_MODULE_NAME "susfs_guard_lkm"
 #define SUSFS_LKM_SYSFS_DIR   "/sys/module/" SUSFS_LKM_MODULE_NAME
+
+/* The build's version string.  It lives here rather than in susfs_main.c because imports_guard.c
+ * reports it when it refuses a load - and that happens before susfs_main.c prints its banner. */
+#define SUSFS_LKM_VERSION "2.3.0-gki"
 
 #define SUSFS_HIDE_MODULES_NODE "/proc/susfs_hide_modules"
 bool susfs_hide_modules_active(void);
