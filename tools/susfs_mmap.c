@@ -250,7 +250,11 @@ static u64 puthex2(char *dst, u64 pos, u64 v)
 	return pos;
 }
 
-static u64 emit_maps_line(char *out, u64 pos, u64 addr)
+/* `out` is a pointer parameter, so sizeof(out) here is 8, not the caller's 4096-byte buffer:
+ * the bound that meant to stop at the end of the buffer stopped at byte 8 instead, which the
+ * accumulated prefix always exceeds - the mapping line was never copied, and `found = 1` then
+ * suppressed the "(the mapping is not listed)" answer too.  Take the capacity explicitly. */
+static u64 emit_maps_line(char *out, u64 cap, u64 pos, u64 addr)
 {
 	long n = read_file("/proc/self/maps", fbuf, sizeof(fbuf));
 	long i = 0;
@@ -271,7 +275,7 @@ static u64 emit_maps_line(char *out, u64 pos, u64 addr)
 			while (k < j && fbuf[k] != ' ')
 				end = (end << 4) | hexval(fbuf[k++]);
 			if (addr >= start && addr < end) {
-				for (k = i; k < j && pos + 1 < sizeof(out); k++)
+				for (k = i; k < j && pos + 1 < cap; k++)
 					out[pos++] = fbuf[k];
 				out[pos] = 0;
 				found = 1;
@@ -463,7 +467,7 @@ void mmap_main(long argc, char **argv)
 		pos = put(out, pos, "\n");
 	}
 
-	pos = emit_maps_line(out, pos, (u64)map);
+	pos = emit_maps_line(out, sizeof(out), pos, (u64)map);
 	pos = emit_stat(out, pos, "mapped", path);
 	if (argc > 3)		/* argv[2] is the optional mapping size */
 		pos = emit_stat(out, pos, "argv3", argv[3]);
