@@ -182,6 +182,10 @@ static void susfs_tw_func(struct callback_head *cb)
 		break;
 	}
 	kfree(tw);
+
+	/* Pairs with the try_module_get() in reboot_pre(): the callback runs from module .text,
+	 * after the syscall has already returned to userspace. */
+	module_put(THIS_MODULE);
 }
 
 /* Commands susfs_tw_func() above actually dispatches - keep the two in sync.
@@ -251,15 +255,26 @@ static int reboot_pre(struct kprobe *kp, struct pt_regs *regs)
 		return 0;
 	}
 
-	tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
-	if (!tw)
+	/* The callback runs from module .text when this task next returns to userspace, which can
+	 * be after `rmmod` has already freed the module: the kprobe is on a vmlinux symbol, so
+	 * its registration does not hold a reference for us, and unregister_kprobe() cannot
+	 * cancel a task_work that is already queued.  Pin the module until the callback has
+	 * run.  GFP_ATOMIC context, so no sleeping here. */
+	if (!try_module_get(THIS_MODULE))
 		return 0;
+
+	tw = kzalloc(sizeof(*tw), GFP_ATOMIC);
+	if (!tw) {
+		module_put(THIS_MODULE);
+		return 0;
+	}
 	tw->cmd = cmd;
 	tw->payload = payload;
 	tw->cb.func = susfs_tw_func;
 
 	if (task_work_add(current, &tw->cb, TWA_RESUME)) {
 		kfree(tw);
+		module_put(THIS_MODULE);
 		pr_warn("susfs supercall: task_work_add failed\n");
 		return 0;
 	}
