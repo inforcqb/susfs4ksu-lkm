@@ -184,9 +184,15 @@ class Ko:
 def main():
     ap = argparse.ArgumentParser(description='CFI-checked indirect call sites in a .ko')
     ap.add_argument('kos', nargs='+')
-    ap.add_argument('--allow', default='',
-                    help='comma-separated functions whose instrumented calls are safe by construction')
+    ap.add_argument('--allow', default=None,
+                    help='comma-separated functions whose instrumented calls are safe by construction; '
+                         'the option has to be given - use --allow "" to allow nothing')
     args = ap.parse_args()
+    if args.allow is None:
+        print('::error:: --allow was not given: pass the allow-list explicitly (--allow "" allows '
+              'nothing).  Without the option this check cannot tell an expected site from a stray one, '
+              'and an unset CI variable used to read as "everything is expected"')
+        return 1
     allow = {x.strip() for x in args.allow.split(',') if x.strip()}
 
     bad = 0
@@ -215,7 +221,7 @@ def main():
         for s in sites:
             mark = 'ok  ' if s in allow else 'FAIL'
             print('   %s %s (reloc=%d ldur=%d)' % (mark, s, reloc.get(s, 0), ldur.get(s, 0)))
-        if outside and allow:
+        if outside:
             print('   ::error:: %s not in the allow-list: a checked indirect call in these '
                   'functions panics at run time (make the enclosing function __nocfi, or add '
                   'it to the allow-list with a reason)' % ', '.join(outside))
