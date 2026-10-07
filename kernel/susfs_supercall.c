@@ -48,12 +48,21 @@ out:
 		pr_warn("susfs show_variant copy_to_user failed\n");
 }
 
+/* List every feature this LKM implements: the first line marks the source (an LKM, not a built-in
+ * SUSFS) and the rest use upstream CONFIG macro names.  Entries with an `active` callback are
+ * reported only while the feature is really installed: advertising a feature whose registration
+ * failed is the exact inconsistency a detector probes for, so failing ones are omitted (and logged
+ * by their init). */
 struct feature_entry {
 	const char *name;
 	bool (*active)(void);	/* NULL = always present */
 };
 
 static const struct feature_entry enabled_features[] = {
+	/* First line, and deliberately not a CONFIG_* name: the caller has to be able to tell this
+	 * list apart from a built-in SUSFS's, whose features live in the kernel image and have a
+	 * different lifecycle (no load/unload, no /sys/module entry, no module parameters). */
+	{ "SUSFS_LKM_MODULES\n",		NULL },
 	{ "CONFIG_KSU_SUSFS_SUS_PATH\n",	sus_path_lsm_active },
 	{ "CONFIG_KSU_SUSFS_SUS_MOUNT\n",	NULL },
 	{ "CONFIG_KSU_SUSFS_SUS_KSTAT\n",	NULL },
@@ -63,8 +72,7 @@ static const struct feature_entry enabled_features[] = {
 	{ "CONFIG_KSU_SUSFS_SPOOF_CMDLINE_OR_BOOTCONFIG\n", NULL },
 	{ "CONFIG_KSU_SUSFS_OPEN_REDIRECT\n",	NULL },
 	{ "CONFIG_KSU_SUSFS_SUS_MAP\n",		NULL },
-
-	{ "SUSFS_GUARD_LKM_HIDE_MODULES\n",	susfs_hide_modules_active },
+	/* hide_modules is not upstream's, so it is not listed here - the feature itself is unchanged. */
 };
 
 static struct st_susfs_enabled_features susfs_enabled_features_nomem;

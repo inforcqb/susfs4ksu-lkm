@@ -49,6 +49,8 @@ static bool hide_module_name_match(const char *name)
 	return hit;
 }
 
+/* No internal caller since the feature list stopped advertising hide_modules (susfs_supercall.c);
+ * kept because hide_modules is still a /proc-visible feature. */
 bool susfs_hide_modules_active(void)
 {
 	return n_hide_modules > 0;
