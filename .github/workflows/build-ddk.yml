@@ -138,7 +138,7 @@ jobs:
           echo "--- the mm's vma container (mm->mmap list before 6.1, mm->mm_mt from 6.1) ---"
           grep -nE 'struct vm_area_struct \*mmap;|struct maple_tree mm_mt;' "$T/include/linux/mm_types.h" || true
           grep -nE '^#define VMA_ITERATOR|^#define for_each_vma' "$T/include/linux/mm_types.h" "$T/include/linux/mm.h" || true
-          echo "--- kallsyms_on_each_symbol (its callback lost the struct module * in 6.5) ---"
+          echo "--- kallsyms_on_each_symbol (its callback lost the struct module * in 6.4) ---"
           grep -nA3 'kallsyms_on_each_symbol' "$T/include/linux/kallsyms.h" | head -12 || true
           echo "--- task_work_add notify modes ---"
           grep -nE 'TWA_RESUME|task_work_add' "$T/include/linux/task_work.h" || true
@@ -224,7 +224,17 @@ jobs:
           # These five are resolved at RUNTIME by name (kprobe bootstrap, kernel/symbol_resolver.c) and must never appear in
           # the artifact's undefined list: measured on a 6.1 device whose KernelSU is a module, all five are provided by
           # kernelsu.ko, so an import would make this module refuse to load without KernelSU.  Asserted on the ARTIFACT.
-          nm -u "$f" | wc -l | sed 's/^/  undefined symbols total: /'
+          # nm has to exist and has to have read the file: with no output at all `ks` is 0 and this gate passes by default.
+          command -v nm >/dev/null 2>&1 || {
+            echo "::error::nm is not available in this image, so the kallsyms_* regression gate cannot run"
+            exit 1
+          }
+          ut=$(nm -u "$f" | wc -l)
+          echo "  undefined symbols total: $ut"
+          if [ "${ut:-0}" -eq 0 ]; then
+            echo "::error::nm reported no undefined symbols for $f - it did not read the file, so this gate cannot pass"
+            exit 1
+          fi
           ks=$(nm -u "$f" | grep -cE '(^| )(kallsyms_lookup_name|kallsyms_lookup|kallsyms_lookup_size_offset|kallsyms_on_each_symbol|kallsyms_on_each_match_symbol)$' || true)
           echo "  undefined kallsyms-ish symbols: $ks (must be 0)"
           if [ "$ks" != "0" ]; then
@@ -321,10 +331,20 @@ jobs:
             echo "::error::$KO does not exist - the build step must have failed, so its undefined symbols cannot be checked"
             exit 1
           fi
+          # nm has to exist and has to have read the file: an empty list makes the loop below do nothing and the step
+          # report "all 0 undefined symbols are present" (set -e does not catch it - the pipeline status comes from awk).
+          command -v nm >/dev/null 2>&1 || {
+            echo "::error::nm is not available in this image, so this gate cannot run"
+            exit 1
+          }
           nm "$KO" | awk '$1 == "U" || $1 == "w" || $1 == "v" { print $NF }' | sort -u > /tmp/undef-syms.txt
           tu=$(wc -l < /tmp/undef-syms.txt)
           echo "  undefined symbols in the artifact: $tu"
           echo "  names: $(tr '\n' ' ' < /tmp/undef-syms.txt)"
+          if [ "${tu:-0}" -eq 0 ]; then
+            echo "::error::no undefined symbols were read from $KO - every module imports something, so nm did not read the file and this gate cannot pass"
+            exit 1
+          fi
           miss=0
           while read -r s; do
             [ -n "$s" ] || continue
