@@ -959,8 +959,20 @@ static int or_add(const char *target, const char *redirected, int scheme)
 		return -ENOSPC;
 	}
 	e = &or_entries[nor++];
+	/* Take the slot, then mark it "not published" before a single field lands in it.  The
+	 * array is static, so a never-used slot already has dead == false - which means the
+	 * WRITE_ONCE(e->dead, false) below is a no-op for a fresh slot and the "cleared LAST, so
+	 * false means the rest of the entry is complete" invariant never held: nor++ publishes
+	 * the slot while target_ino/target_dev are still zero, and those two fields are written
+	 * BEFORE the two struct path fields.  A lockless reader (or_find_by_inode() and friends,
+	 * called from the kprobes) could therefore match a real (ino, dev) and hand
+	 * &e->redirected_path - still { NULL, NULL } - to vfs_open(), or &e->target_path to
+	 * d_path()/vfs_statfs().  vfs_open() does d_backing_inode(path->dentry) immediately, so
+	 * that is a NULL dereference in the kernel.  uid_scheme is also still 0 there, which is
+	 * UID_NON_APP_PROC, so even root's own open of the target passes the gate. */
+	WRITE_ONCE(e->dead, true);
+	smp_wmb();		/* the flag must be visible before the fields it guards */
 	strscpy(e->target_pathname, target, OR_PATH_MAX);
-
 	strscpy(e->redirected_pathname, redirected, OR_PATH_MAX);
 	e->target_ino = ti->i_ino;
 	e->target_dev = ti->i_sb->s_dev;
