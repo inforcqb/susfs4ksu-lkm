@@ -23,6 +23,16 @@ static inline bool susfs_abi_path_ok(const char *field, size_t size)
 	return strnlen(field, size) < size;
 }
 
+/* Refuse to load when this image's imported symbol addresses are not kernel addresses, i.e. when
+ * the loader that put it in did not absolutize them.  Returns 0 when they are all filled in, -EINVAL
+ * otherwise (and prints which ones are missing).  Called first in susfs_init(). */
+int susfs_imports_guard(void);
+
+/* Second half of the same check, called once the symbol resolver is up: every import whose name
+ * kallsyms has exactly once must hold that address, so an image absolutized from the wrong symbol
+ * table (a stale kallsyms, or the wrong occurrence of a duplicate name) is refused as well. */
+int susfs_imports_crosscheck(void);
+
 /* Add a path to sus_path's hidden set from kernel code (no supercall needed); returns 0 or negative errno. */
 int sus_path_add_hidden(const char *path);
 

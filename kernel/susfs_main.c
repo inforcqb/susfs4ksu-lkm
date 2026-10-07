@@ -129,8 +129,19 @@ static int __init susfs_init(void)
 {
     int i;
 
+    /* First, before any layer runs and while nothing is armed: an import that was not filled in
+     * is an address this module would jump to on its first call through it.  See
+     * imports_guard.c - a loader that continues after an unresolved name leaves it zero, which
+     * the kernel accepts without a word. */
+    if (susfs_imports_guard())
+        return -EINVAL;
+
     SUSFS_LOGI("init v%s\n", SUSFS_LKM_VERSION);
     ksu_init_symbol_resolver();
+
+    /* Now that kallsyms lookups work, check the addresses themselves: see imports_guard.c. */
+    if (susfs_imports_crosscheck())
+        return -EINVAL;
 
     for (i = 0; i < (int)ARRAY_SIZE(susfs_layers); i++) {
         int ret;
