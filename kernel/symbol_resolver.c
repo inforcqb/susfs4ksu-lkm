@@ -41,9 +41,9 @@ static const size_t cfi_suffix_len = sizeof(cfi_suffix) - 1;
 #define ALWAYS_HAVE_ON_EACH_SYMBOL 0
 #endif
 
-/* kallsyms_on_each_match_symbol() is NOT in 6.1 (measured against upstream: absent in v6.1,
- * present from v6.5, so 6.6 has it).  Gating at 6.1 only bought a spurious "cannot bootstrap"
- * warning on the android14-6.1 variant and then fell back to the kallsyms_lookup_name() path
+/* kallsyms_on_each_match_symbol() is only used from 6.6 up.  The gate is empirical, not a version
+ * fact: gating this path at 6.1 was measured to produce a spurious "cannot bootstrap" warning on
+ * the android14-6.1 variant, after which the code fell back to the kallsyms_lookup_name() path
  * every other build uses anyway. */
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
 #define HAVE_ON_EACH_MATCH_SYMBOL 1
@@ -58,9 +58,10 @@ static unsigned long (*kallsyms_lookup_name_fn)(const char *name) = NULL;
 static const char *(*kallsyms_lookup_fn)(unsigned long addr, unsigned long *symbolsize, unsigned long *offset,
                                          char **modname, char *namebuf) = NULL;
 
-/* The walker lost its `struct module *` argument in 6.6, so the POINTER's type is
+/* The walker lost its `struct module *` argument in v6.4 (the same release that dropped the
+ * leading `struct selinux_state *` from slow_avc_audit()), so the POINTER's type is
  * version-gated like the callbacks below (that argument carried module ownership). */
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 typedef int (*ksu_on_each_symbol_fn_t)(int (*fn)(void *, const char *, unsigned long), void *data);
 #else
 typedef int (*ksu_on_each_symbol_fn_t)(int (*fn)(void *, const char *, struct module *, unsigned long), void *data);
@@ -107,13 +108,13 @@ struct ksu_lookup_symbol_ctx {
 };
 
 /* Exact-name lookup through the walker - reachable only when kallsyms_lookup() did not
- * bootstrap; before 6.6 it is also the module-ownership check (see ksu_exact_name_cb()). */
+ * bootstrap; before 6.4 it is also the module-ownership check (see ksu_exact_name_cb()). */
 struct ksu_exact_name_ctx {
     const char *symbol_name;
     unsigned long addr;
 };
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 static int ksu_exact_name_cb(void *data, const char *name, unsigned long addr)
 #else
 static int ksu_exact_name_cb(void *data, const char *name, struct module *mod, unsigned long addr)
@@ -121,8 +122,8 @@ static int ksu_exact_name_cb(void *data, const char *name, struct module *mod, u
 {
     struct ksu_exact_name_ctx *ctx = data;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
-    /* OWNERSHIP before 6.6: a non-NULL `mod` means another module provides the symbol. */
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
+    /* OWNERSHIP before 6.4: a non-NULL `mod` means another module provides the symbol. */
     if (mod)
         return 0;
 #endif
@@ -174,7 +175,7 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
     }
 
     /* kallsyms_lookup() is unavailable, so the owner has to come from the walker: before
-     * 6.6 its callback is handed the owning `struct module *` and ksu_exact_name_cb()
+     * 6.4 its callback is handed the owning `struct module *` and ksu_exact_name_cb()
      * refuses a non-NULL mod.  The walk must also confirm the address, or we would be
      * trusting a symbol we could not check. */
     if (kallsyms_on_each_symbol_fn) {
@@ -188,7 +189,7 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
         return addr;
     }
 
-    /* Neither kallsyms_lookup() nor the walker bootstrapped, and from 6.6 the walker does
+    /* Neither kallsyms_lookup() nor the walker bootstrapped, and from 6.4 the walker does
      * not carry the owner either: fail closed rather than take a symbol whose owner cannot
      * be verified. */
     pr_warn("ignore symbol %s: its owner cannot be checked on this kernel\n", symbol_name);
@@ -203,7 +204,7 @@ struct ksu_all_names_ctx {
     int n;
 };
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 static int ksu_all_names_cb(void *data, const char *name, unsigned long addr)
 #else
 static int ksu_all_names_cb(void *data, const char *name, struct module *mod, unsigned long addr)
@@ -212,7 +213,7 @@ static int ksu_all_names_cb(void *data, const char *name, struct module *mod, un
     struct ksu_all_names_ctx *ctx = data;
     int i;
 
-#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 6, 0)
+#if LINUX_VERSION_CODE < KERNEL_VERSION(6, 4, 0)
     if (mod)
         return 0;
 #endif
@@ -275,7 +276,7 @@ static inline bool ksu_symbol_has_suffix(const char *name, size_t name_len, cons
     return name_len >= suffix_len && strcmp(name + name_len - suffix_len, suffix) == 0;
 }
 
-#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 6, 0)
+#if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 4, 0)
 static int lookup_symbol_variant_cb(void *data, const char *name, unsigned long addr)
 #else
 static int lookup_symbol_variant_cb(void *data, const char *name, struct module *mod, unsigned long addr)
