@@ -11,24 +11,31 @@
  *
  * A plain `insmod` therefore fails on the first unresolvable name (which is fine - it never
  * runs).  The case worth defending against is a loader that cannot find a name and continues
- * with the value it had, i.e. zero.  What the kernel does with that zero decides whether this
- * guard can help:
+ * with the value it had, i.e. zero.  What the kernel does with that zero splits the names below
+ * in two, and the split is not the same on every variant (measured per artifact, by aggregating
+ * every relocation that targets an imported name):
  *
- *   - A name module code reaches through a PC-relative relocation overflows that relocation when
- *     zeroed, so the kernel refuses the image itself (-ENOEXEC, "overflow in relocation type 275
- *     val 0") before init_module() is reached.  Nothing to catch.
- *   - The four param_ops_* names are referenced only by R_AARCH64_ABS64, so a zero is accepted in
- *     silence - and then it is fatal in a way no check in this module can undo: the kernel frees
- *     a module whose init returned non-zero through free_module() -> destroy_params(), which
- *     reads params->ops->free without testing ops for NULL (measured on a 5.15 GKI build: Oops at
- *     +0x18 of struct kernel_param_ops, and a reboot where panic_on_oops is set).  Loading
- *     without refusing is not better - reading or writing the parameter, and unloading the
- *     module, take the same NULL ops path.
+ *   - Most of them are reached by module code through a PC-relative relocation - 49 of the 53 in
+ *     the LLVM-CFI builds (5.10/5.15), 45 in the kCFI builds (6.1+).  Zeroing one of those
+ *     overflows its relocation, so the kernel refuses the image itself (-ENOEXEC, "overflow in
+ *     relocation type 275 val 0") before init_module() is reached.  Nothing to catch.
+ *   - The rest are reached only through function or data pointers and are referenced by
+ *     R_AARCH64_ABS64 alone, so the kernel accepts a zero in silence: param_ops_bool/int/string/
+ *     ulong, plus single_release, seq_read, seq_lseek and delayed_work_timer_fn on the kCFI
+ *     builds.  The floor check below is the only line of defence for those - and for the four
+ *     param_ops_* it is a weak one, because no check in this module can undo the damage: the
+ *     kernel frees a module whose init returned non-zero through free_module() ->
+ *     destroy_params(), which reads params->ops->free without testing ops for NULL (measured on a
+ *     5.15 GKI build: Oops at +0x18 of struct kernel_param_ops, and a reboot where panic_on_oops
+ *     is set).  Loading without refusing is no better - reading or writing the parameter, and
+ *     unloading the module, take the same NULL ops path.  Refusing a zeroed pointer out of
+ *     file_operations / seq_operations / delayed_work has no such problem: that load simply fails.
  *
  * So: check that every import below has a plausible kernel address before anything else in
- * init runs.  For those four the check can only name the cause in the log before the kernel
- * faults; what keeps them filled is the loaders, plus the build-time assertion of every import
- * against the target kernel's System.map.
+ * init runs.  For the param_ops_* case the check can only name the cause in the log before the
+ * kernel faults; for every other name it is what actually stops the load.  What keeps them all
+ * filled is the loaders, plus the build-time assertion of every import against the target
+ * kernel's System.map.
  * Only names present in every variant's import list are listed here - a name a variant does not
  * import would turn this guard itself into a new unresolved symbol. */
 
