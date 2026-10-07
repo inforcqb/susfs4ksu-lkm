@@ -22,9 +22,12 @@ susfs_guard_lkm-objs := susfs_main.o patch_memory.o symbol_resolver.o lsm_hook.o
 # `#if KSU_NEW_DCACHE_FLUSH`, so an unset srctree silently selected the 5.14+ spelling on
 # every kernel and left an undefined dcache_clean_inval_poc in the module.  Fail loudly
 # instead of guessing.
-ifeq ($(srctree),)
-$(error srctree is not set - build this module through kbuild: make -C $(KDIR) M=$(PWD) modules)
-endif
+#
+# `srctree` is set only when kbuild reaches this file (make -C $KDIR M=$PWD ...).  The check for
+# it used to be a parse-time $(error), which aborted make before any goal was chosen and so made
+# the `all:` entry point below - and KDIR's default - unreachable.  It now lives in the `all:`
+# recipe, i.e. it fires when the build is actually attempted.
+KSU_SRCTREE_MISSING := $(if $(srctree),0,1)
 KSU_HAS_OLD_DCACHE := $(shell grep -l __flush_dcache_area $(srctree)/arch/arm64/include/asm/cacheflush.h 2>/dev/null)
 ifneq ($(KSU_HAS_OLD_DCACHE),)
 KSU_NEW_DCACHE_FLUSH := 0
@@ -49,7 +52,12 @@ ccflags-y += -I$(srctree)/fs
 KDIR ?= /lib/modules/$(shell uname -r)/build
 
 all:
+ifeq ($(KSU_SRCTREE_MISSING),1)
+	@echo "srctree is not set - build this module through kbuild: make -C \$${KDIR} M=\$${PWD} modules" >&2
+	@exit 1
+else
 	$(MAKE) -C $(KDIR) M=$(PWD) modules
+endif
 
 clean:
 	$(MAKE) -C $(KDIR) M=$(PWD) clean
