@@ -3,8 +3,8 @@
 /* Refuse to load when the imported symbol addresses were not filled in.
  *
  * Every symbol this module imports is a strong SHN_UNDEF entry, and the kernel cannot resolve
- * most of them: they are not in its export table (kallsyms_lookup_name, saved_boot_config,
- * init_mm, ...) or they are namespaced (kern_path, ihold, ...).  They arrive resolved only when
+ * most of them: they are not in its export table (saved_boot_config, init_mm, ...) or they are
+ * namespaced (kern_path, ihold, ...).  They arrive resolved only when
  * the image is rewritten before it reaches the kernel - `ksud insmod` and the bundled
  * susfs_insmod walk the symbol table and turn each SHN_UNDEF into SHN_ABS with the address
  * kallsyms has for that name.
@@ -22,10 +22,10 @@
  *     guarantee: a CPU that needs the A53 erratum 843419 workaround can get an ADRP veneer
  *     pointing at the symbol instead, which accepts the zero.
  *   - Branch-only names: 43 of the 53 in the LLVM-CFI builds (5.10/5.15), 39 in the kCFI builds
- *     (6.1+).  A zero here is NOT necessarily refused - an out-of-range CALL26/JUMP26 can be
- *     answered with a PLT entry whose target is the symbol, i.e. zero, and then the image loads.
- *     Whether that happens is a property of the kernel, not of this table, so on the kernels
- *     measured here treat "the loader will refuse it" as false for this class.
+ *     (6.1+).  A zero here is NOT necessarily refused - the loader can answer an out-of-range
+ *     CALL26/JUMP26 with a PLT entry for the symbol instead of refusing the image, and then it
+ *     loads.  Whether that happens is a property of the kernel, not of this table, so on the
+ *     kernels measured here treat "the loader will refuse it" as false for this class.
  *   - Pointer-only names, referenced by R_AARCH64_ABS64 alone: param_ops_bool/int/string/ulong on
  *     every variant, plus single_release, seq_read, seq_lseek and delayed_work_timer_fn in the
  *     kCFI builds (the first three are proc_ops callbacks, in the seven struct proc_ops objects
