@@ -301,7 +301,8 @@ static int ksu_lsm_hook_insert_head(struct ksu_lsm_hook *hook, struct hlist_head
         if (ksu_lsm_hook_patch_slot((void **)&head->first, first))
             pr_err("lsm_hook: %s: failed to roll back head->first after a failed insert\n",
                     hook->head_name ?: "unknown");
-        node->list.next = NULL;
+        /* Leave ->next alone for the same reason as in the unlink path below: a walker can still
+         * be inside this node, and a NULL there ends its walk early. */
         node->list.pprev = NULL;
         return ret;
     }
@@ -342,7 +343,11 @@ static int ksu_lsm_hook_remove_head(struct ksu_lsm_hook *hook)
         }
     }
 
-    hook->list.list.next = NULL;
+    /* The node's own forward pointer is deliberately left alone - hlist removal does not clear
+     * it either, and the dispatch loop reads pos->member.next AFTER the callee returns: a walker
+     * still inside our node would read NULL, end the walk, and leave every LSM after us
+     * (SELinux included) unasked, with call_int_hook() returning our own LSM_RET_DEFAULT.
+     * Re-publishing does not need it: ksu_lsm_hook_insert_head() memsets the node first. */
     hook->list.list.pprev = NULL;
     hook->entry = NULL;
     SUSFS_LOGI("lsm_hook: removed %s node from its list\n", hook->head_name ?: "unknown");
