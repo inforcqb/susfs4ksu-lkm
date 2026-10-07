@@ -11,14 +11,22 @@
  *
  * A plain `insmod` therefore fails on the first unresolvable name (which is fine - it never
  * runs).  The case worth defending against is a loader that cannot find a name and continues
- * with the value it had, i.e. zero.  What the kernel does with that zero splits the names below
- * in two, and the split is not the same on every variant (measured per artifact, by aggregating
- * every relocation that targets an imported name):
+ * with the value it had, i.e. zero.  Whether the kernel then notices depends on how the name is
+ * reached, so the table below covers three classes (measured per artifact, by aggregating every
+ * relocation that targets an imported name):
  *
- *   - Most of them are reached by module code through a PC-relative relocation - 49 of the 53 in
- *     the LLVM-CFI builds (5.10/5.15), 45 in the kCFI builds (6.1+).  Zeroing one of those
- *     overflows its relocation, so the kernel refuses the image itself (-ENOEXEC, "overflow in
- *     relocation type 275 val 0") before init_module() is reached.  Nothing to catch.
+ *   - 49 of the 53 names are reached by module code through a PC-relative relocation in the
+ *     LLVM-CFI builds (5.10/5.15) and 45 in the kCFI builds (6.1+).  Within that class, six carry
+ *     the value inside a page-address sequence (ADR_PREL_PG_HI21): saved_boot_config, init_mm,
+ *     memstart_addr, arm64_use_ng_mappings, __tracepoint_sys_exit, kmalloc_caches.  Zeroing one of
+ *     THOSE overflows its relocation and the kernel refuses the image (-ENOEXEC, "overflow in
+ *     relocation type 275 val 0" - measured, 275 is ADR_PREL_PG_HI21).
+ *   - The other 43 (5.10/5.15) and 39 (6.1+) of that class are reached by branches only, and a
+ *     zero there is NOT necessarily refused: these builds carry CONFIG_ARM64_MODULE_PLTS (the
+ *     .plt sections are in the artifacts), and arch/arm64's module loader answers an out-of-range
+ *     branch relocation by emitting a PLT entry whose target is the symbol value - i.e. zero -
+ *     and retrying.  Whether a slot was reserved for it is a CONFIG_RANDOMIZE_BASE matter, so
+ *     treat "the kernel will refuse it" as false for this class.
  *   - The rest are reached only through function or data pointers and are referenced by
  *     R_AARCH64_ABS64 alone, so the kernel accepts a zero in silence: param_ops_bool/int/string/
  *     ulong, plus single_release, seq_read, seq_lseek and delayed_work_timer_fn on the kCFI
@@ -32,10 +40,12 @@
  *     file_operations / seq_operations / delayed_work has no such problem: that load simply fails.
  *
  * So: check that every import below has a plausible kernel address before anything else in
- * init runs.  For the param_ops_* case the check can only name the cause in the log before the
- * kernel faults; for every other name it is what actually stops the load.  What keeps them all
- * filled is the loaders, plus the build-time assertion of every import against the target
- * kernel's System.map.
+ * init runs.  On the kCFI builds that covers the whole table; on the LLVM-CFI builds it covers the
+ * ten data entries, because &name for a function is a module-local stub there (see the floor check
+ * below) - and for those 43 the kernel may accept a zero, which leaves a hole this check cannot
+ * close, so the loaders and the build-time assertion of every import against the target kernel's
+ * System.map stay the real defence.  For the param_ops_* case the check can only name the cause in
+ * the log before the kernel faults; for every other name it is what stops the load.
  * Only names present in every variant's import list are listed here - a name a variant does not
  * import would turn this guard itself into a new unresolved symbol. */
 

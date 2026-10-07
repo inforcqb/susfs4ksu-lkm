@@ -32,7 +32,9 @@ int susfs_imports_guard(void);
 
 /* Second half of the same check, called once the symbol resolver is up: every import whose name
  * kallsyms has exactly once must hold that address, so an image absolutized from the wrong symbol
- * table (a stale kallsyms, or the wrong occurrence of a duplicate name) is refused as well. */
+ * table (a stale kallsyms, or the wrong occurrence of a duplicate name) is refused as well.
+ * The definition carries __nocfi (it calls into the kernel through the resolver's function
+ * pointers); the attribute belongs on the definition, so it is not repeated here. */
 int susfs_imports_crosscheck(void);
 
 /* Add a path to sus_path's hidden set from kernel code (no supercall needed); returns 0 or negative errno. */
