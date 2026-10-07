@@ -18,6 +18,10 @@
  * implemented for it: an insertion implementation would have to be mirrored there (the
  * node list is not walked at all, so inserting into security_hook_heads would have no
  * effect).  hook->insert is rejected with -ENOSYS on that branch.
+ *
+ * A hook that cannot be unlinked or restored is fatal on purpose (panic) - see
+ * ksu_lsm_unhook(): the kernel would keep calling into this module's .text after
+ * free_module(), and a failing module exit cannot be refused.
  */
 #include <linux/compiler.h>
 #include <linux/errno.h>
@@ -297,10 +301,18 @@ static int ksu_lsm_hook_insert_head(struct ksu_lsm_hook *hook, struct hlist_head
      *    a later removal of THAT node must not unlink from a stale pointer into ours. */
     ret = ksu_lsm_hook_patch_slot((void **)&first->pprev, &node->list.next);
     if (ret) {
+        int rb;
+
         /* Roll back the publication - a wrong-way neighbour corrupts the list. */
-        if (ksu_lsm_hook_patch_slot((void **)&head->first, first))
-            pr_err("lsm_hook: %s: failed to roll back head->first after a failed insert\n",
-                    hook->head_name ?: "unknown");
+        rb = ksu_lsm_hook_patch_slot((void **)&head->first, first);
+        if (rb) {
+            /* The node stays published while hook->entry stays NULL and the caller untracks the hook,
+             * so no exit path would ever unlink it: the LSM list would keep a pointer into this module
+             * after free_module(), and a failing module load cannot be refused either.  Same policy as
+             * ksu_lsm_unhook(). */
+            panic("lsm_hook: %s: failed to roll back head->first (%d) after a failed insert (%d), node still published\n",
+                    hook->head_name ?: "unknown", rb, ret);
+        }
         /* Leave ->next alone for the same reason as in the unlink path below: a walker can still
          * be inside this node, and a NULL there ends its walk early. */
         node->list.pprev = NULL;
@@ -587,13 +599,9 @@ int ksu_lsm_hook(struct ksu_lsm_hook *hook)
         goto out_untrack;
     }
 
-    if (ksu_lsm_hook_update_scall(selected_scall, hook->replacement)) {
-        if (ksu_lsm_hook_patch_slot(selected_slot, selected_origin)) {
-            pr_err("lsm_hook: failed to roll back %s after static call update failure\n", hook->head_name ?: "unknown");
-        }
-        ret = -EFAULT;
-        goto out_untrack;
-    }
+    /* Infallible by API - __static_call_update() is void and ksu_lsm_hook_update_scall() returns 0
+     * (the same reasoning as in ksu_lsm_unhook()), so there is no failure to roll back here. */
+    ksu_lsm_hook_update_scall(selected_scall, hook->replacement);
 
     if (!selected_origin)
         static_branch_enable(selected_scall->active);
@@ -721,9 +729,14 @@ out_unlock:
     return ret;
 }
 
+/* Fail-stop by design: a failed unlink or restore leaves a hook that the kernel keeps calling after
+ * free_module() has returned this module's memory, and a failing module exit cannot be refused (the
+ * kernel does not support one).  Every failure below stops the machine instead of returning with a
+ * live pointer into freed .text behind it. */
 void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
 {
     void **slot;
+    int ret;
     mutex_lock(&ksu_lsm_hook_lock);
 
 #if LINUX_VERSION_CODE >= KERNEL_VERSION(6, 12, 0)
@@ -732,17 +745,13 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
         return;
     }
     slot = (void **)((char *)hook->entry + hook->hook_offset);
-    if (ksu_lsm_hook_patch_slot(slot, hook->original)) {
-        pr_err("lsm_hook: failed to restore %s\n", hook->head_name ?: "unknown");
-        mutex_unlock(&ksu_lsm_hook_lock);
-        return;
-    }
-    if (ksu_lsm_hook_update_scall(hook->scall, hook->original)) {
-        if (ksu_lsm_hook_patch_slot(slot, hook->replacement))
-            pr_err("lsm_hook: failed to reapply %s after static call restore failure\n", hook->head_name ?: "unknown");
-        mutex_unlock(&ksu_lsm_hook_lock);
-        return;
-    }
+    ret = ksu_lsm_hook_patch_slot(slot, hook->original);
+    if (ret)
+        panic("lsm_hook: %s: could not restore the hook slot (%d) - not unloading with the replacement installed\n",
+                hook->head_name ?: "unknown", ret);
+    /* Infallible by API: __static_call_update() is void and ksu_lsm_hook_update_scall() returns 0, so
+     * the slot restore above is the only step on this branch that can fail. */
+    ksu_lsm_hook_update_scall(hook->scall, hook->original);
     SUSFS_LOGI("lsm_hook: restored %s hook slot %px to %px\n", hook->head_name ?: "unknown", slot, hook->original);
 #else
     if (!hook->entry) {
@@ -753,18 +762,17 @@ void ksu_lsm_unhook(struct ksu_lsm_hook *hook)
     if (hook->entry == &hook->list) {
         /* Our own security_hook_list node is in the list: an insert node, or (legacy) a
          * replace-mode hook that found its head empty; both unlink through list.pprev. */
-        if (ksu_lsm_hook_remove_head(hook)) {
-            mutex_unlock(&ksu_lsm_hook_lock);
-            return;
-        }
+        ret = ksu_lsm_hook_remove_head(hook);
+        if (ret)
+            panic("lsm_hook: %s: could not unlink the hook node (%d) - not unloading with it still linked\n",
+                    hook->head_name ?: "unknown", ret);
     } else {
         slot = (void **)((char *)hook->entry + hook->hook_offset);
         SUSFS_LOGI("unhook patch slot\n");
-        if (ksu_lsm_hook_patch_slot(slot, hook->original)) {
-            pr_err("lsm_hook: failed to restore %s\n", hook->head_name ?: "unknown");
-            mutex_unlock(&ksu_lsm_hook_lock);
-            return;
-        }
+        ret = ksu_lsm_hook_patch_slot(slot, hook->original);
+        if (ret)
+            panic("lsm_hook: %s: could not restore the hook slot (%d) - not unloading with the replacement installed\n",
+                    hook->head_name ?: "unknown", ret);
         SUSFS_LOGI("lsm_hook: restored %s hook slot %px to %px\n", hook->head_name ?: "unknown", slot, hook->original);
     }
 #endif
