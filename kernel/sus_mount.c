@@ -1561,9 +1561,121 @@ static int sus_mount_keep_format(char *buf, size_t size)
 	return n;
 }
 
+/* ---- insmod parameters must not touch the guard-protected side --------------------------------
+ * module_param_cb()'s setter runs during load_module()'s parse_args(), i.e. BEFORE susfs_init() has
+ * reached susfs_imports_guard() and before this layer is up.  sus_mount_keep_command() is not
+ * import-free: committing the list takes spin_lock_irqsave(&mount_keep_lock) and the rescan walks the
+ * mount namespace - and _raw_spin_lock_irqsave is one of the imports the guard's table covers
+ * (imports_guard.c), so a loader that left it at zero jumped to address 0 before anything could refuse
+ * the load.  The setter therefore validates the shape and caches the raw value, and
+ * susfs_sus_mount_init() applies it through the same entry point once the guard has passed.
+ * mount_keep_ready marks the point after which the setter applies live, and sus_mount_keep_param_lock
+ * keeps the two orders from interleaving (the commit replaces the list, so a write landing between
+ * "ready = true" and the cached apply must not be clobbered by the older value).  (That guard table is
+ * not the whole import set: ordinary exports such as strscpy/kvmalloc are the loader's and the
+ * build-time System.map gate's business, so the validation below may use them.)
+ *
+ * One entry of that table is still reached from here on purpose: sus_mount_keep_param_lock is taken in
+ * parse_args(), and mutex_lock/mutex_unlock are in that table as well - so a loader that left those two
+ * at zero would jump to address 0 before susfs_init() could refuse the load.  It is not removable by a
+ * local change: the mutex is what orders "cache the value" against "apply the cached value", and the
+ * other mutual-exclusion primitives available here (_raw_spin_lock*, __rcu_read_*) are in that table
+ * too.  Closing it needs a lock-free publication of the cached value (store, then re-check the ready
+ * flag and apply live), which is a change of its own. */
+static char mount_keep_pending[SUS_MOUNT_KEEP_CMDLINE];
+static bool mount_keep_pending_given;
+static bool mount_keep_ready;
+static DEFINE_MUTEX(sus_mount_keep_param_lock);
+
+/* Validation only, through the same parser the command uses (limits and error codes cannot drift).
+ * No lock, no commit, no rescan - safe to call from parse_args(). */
+static int sus_mount_keep_list_check(const char *list)
+{
+	char (*dst)[SUS_MOUNT_KEEP_LEN];
+	int rc;
+
+	dst = kvmalloc_array(SUS_MOUNT_KEEP_MAX, SUS_MOUNT_KEEP_LEN, GFP_KERNEL);
+	if (!dst)
+		return -ENOMEM;
+	rc = sus_mount_keep_parse(list, dst, SUS_MOUNT_KEEP_MAX);
+	kvfree(dst);
+	return rc < 0 ? rc : 0;
+}
+
+/* The grammar sus_mount_keep_command() accepts, checked without running it: `reset`, `clear`,
+ * `set <list>`, `add <prefix>`, `del <prefix>`, or - the insmod form - a bare list.  @val is modified
+ * in place (trailing whitespace trimmed), which is why the caller hands over its own copy. */
+static int sus_mount_keep_check(char *val)
+{
+	const char *arg;
+	size_t i;
+
+	for (i = strlen(val); i > 0 && (val[i - 1] == '\n' || val[i - 1] == '\r' || val[i - 1] == ' '); i--)
+		val[i - 1] = '\0';
+
+	/* An empty value is not "set the list to nothing": that is what `clear` says, and silently emptying
+	 * the prefix list (which the built-in default otherwise seeds) is not something a typo should do. */
+	if (!val[0])
+		return -EINVAL;
+	if (!strcmp(val, "reset") || !strcmp(val, "clear"))
+		return 0;
+	if (!strncmp(val, "set ", 4))
+		return sus_mount_keep_list_check(val + 4);
+	if (!strncmp(val, "add ", 4) || !strncmp(val, "del ", 4)) {
+		arg = val + 4;
+		while (*arg == ' ')
+			arg++;
+		if (!*arg || strlen(arg) >= SUS_MOUNT_KEEP_LEN)
+			return -EINVAL;
+		/* parse_args runs before the list has any entry, so `del` could only fail later (-ENOENT). */
+		if (val[0] == 'd')
+			return -EINVAL;
+		return 0;
+	}
+	return sus_mount_keep_list_check(val);
+}
+
+/* The same trailing-whitespace rule the command applies ("echo" leaves a "\n" behind), used to tell an
+ * empty value from a real one on the live path as well. */
+static bool sus_mount_keep_value_empty(const char *val)
+{
+	size_t i;
+
+	for (i = strlen(val); i > 0; i--)
+		if (val[i - 1] != '\n' && val[i - 1] != '\r' && val[i - 1] != ' ')
+			return false;
+	return true;
+}
+
 static int sus_mount_keep_param_set(const char *val, const struct kernel_param *kp)
 {
-	return sus_mount_keep_command(val, true);
+	int rc;
+
+	mutex_lock(&sus_mount_keep_param_lock);
+	if (mount_keep_ready) {
+		bool empty = sus_mount_keep_value_empty(val);
+		bool too_long = strlen(val) >= SUS_MOUNT_KEEP_CMDLINE;
+
+		mutex_unlock(&sus_mount_keep_param_lock);
+		/* An empty value is not "set the list to nothing" - that is what `clear` says, and the
+		 * pre-init path refuses it for the same reason (see sus_mount_keep_check()).  A value that
+		 * does not fit the command buffer is refused too: its tail is cut off, and the cut can leave
+		 * an empty command behind, i.e. the same silent clear. */
+		return (empty || too_long) ? -EINVAL : sus_mount_keep_command(val, true);
+	}
+
+	/* parse_args(): validate and cache only - see mount_keep_pending.  Validate the value itself, not a
+	 * copy that was already truncated to the cache size. */
+	if (strlen(val) >= sizeof(mount_keep_pending)) {
+		mutex_unlock(&sus_mount_keep_param_lock);
+		return -EINVAL;
+	}
+	strscpy(mount_keep_pending, val, sizeof(mount_keep_pending));
+	rc = sus_mount_keep_check(mount_keep_pending);
+	if (!rc)
+		mount_keep_pending_given = true;
+	mutex_unlock(&sus_mount_keep_param_lock);
+	return rc;
 }
 
 static int sus_mount_keep_param_get(char *buf, const struct kernel_param *kp)
@@ -1905,6 +2017,22 @@ int susfs_sus_mount_init(void)
         SUSFS_LOGI("sus_mount: /proc/susfs_hide_mounts not created (expose_proc=%d lsm=%d)\n",
                 (int)susfs_expose_proc, (int)sus_path_lsm_active());
     }
+
+    /* Apply what the insmod parameter cached (see mount_keep_pending): the import guard has passed and
+     * this layer is up.  Applied AFTER the default seed above on purpose - an explicit
+     * hide_mounts=<list> is what the operator asked for, instead of being silently replaced by the
+     * built-in default (the same shape as hide_modules in susfs_hide_syms.c).  From here on the setter
+     * applies live. */
+    mutex_lock(&sus_mount_keep_param_lock);
+    mount_keep_ready = true;
+    if (mount_keep_pending_given) {
+        int rc = sus_mount_keep_command(mount_keep_pending, true);
+
+        if (rc)
+            pr_warn("sus_mount: applying hide_mounts=\"%s\" from insmod failed %d - that prefix list is not in effect\n",
+                    mount_keep_pending, rc);
+    }
+    mutex_unlock(&sus_mount_keep_param_lock);
     return 0;
 }
 
