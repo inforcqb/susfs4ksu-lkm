@@ -328,12 +328,106 @@ static int hide_modules_format(char *buf, size_t size)
 	return n;
 }
 
+/* ---- insmod parameters must not touch the guard-protected side ---------------------------------
+ * module_param_cb()'s setter runs during load_module()'s parse_args(), i.e. BEFORE susfs_init() has
+ * reached susfs_imports_guard() and before any layer is up.  Applying `hide_modules=<value>` there
+ * reached hide_modules_sync_sysfs() -> sus_path_add_self_hidden() -> kern_path()/ihold() and
+ * sus_path_hooks_arm(), and even reading the table for `add`/`del` takes hide_modules_lock - all of
+ * them imports the guard's table covers (imports_guard.c), so a loader that left one of them at zero
+ * jumped to address 0 before anything could refuse the load.  (The guard's table is not the whole
+ * import set: ordinary exports such as strscpy/kvmalloc are the loader's and the build-time System.map
+ * gate's business, so the validation below may use them.)
+ *
+ * The setter therefore only validates the shape and caches the raw value - the command form is kept,
+ * because the parameter documents the same commands as the /proc node - and susfs_hide_syms_init()
+ * applies it with the very same entry point (hide_modules_command()) once the guard has passed.
+ * hide_syms_ready marks the point after which the setter applies live, and hide_syms_param_lock keeps
+ * the two orders from interleaving: without it a sysfs write landing between "ready = true" and the
+ * cached apply could be overwritten by the older cached value (hide_modules is a commit, not an
+ * append).
+ *
+ * One entry of that table is still reached from here on purpose: hide_syms_param_lock is taken in
+ * parse_args(), and mutex_lock/mutex_unlock are in that table as well - so a loader that left those two
+ * at zero would jump to address 0 before susfs_init() could refuse the load.  It is not removable by a
+ * local change: the mutex is what orders "cache the value" against "apply the cached value", and the
+ * other mutual-exclusion primitives available here (_raw_spin_lock*, __rcu_read_*) are in that table
+ * too.  Closing it needs a lock-free publication of the cached value (store, then re-check the ready
+ * flag and apply live), which is a change of its own. */
+static char hide_modules_pending_val[HIDE_MODULES_CMDLINE];
+static bool hide_modules_pending_given;
+static bool hide_syms_ready;
+static DEFINE_MUTEX(hide_syms_param_lock);
+
+/* Validation only, and through the same parser the command uses, so the limits and the error codes
+ * cannot drift.  No table, no lock, no VFS - safe to call from parse_args(). */
+static int hide_modules_list_check(const char *list)
+{
+	char (*dst)[MODULE_NAME_LEN];
+	int rc;
+
+	dst = kvmalloc_array(HIDE_MODULES_MAX, MODULE_NAME_LEN, GFP_KERNEL);
+	if (!dst)
+		return -ENOMEM;
+	rc = hide_modules_parse(list, dst, HIDE_MODULES_MAX);
+	kvfree(dst);
+	return rc < 0 ? rc : 0;
+}
+
+/* The grammar hide_modules_command() accepts, checked without running it.  @val is modified in place
+ * (trailing whitespace trimmed), which is why the caller hands over its own copy. */
+static int hide_modules_check(char *val)
+{
+	const char *arg;
+	size_t i;
+
+	for (i = strlen(val); i > 0 && (val[i - 1] == '\n' || val[i - 1] == '\r' || val[i - 1] == ' '); i--)
+		val[i - 1] = '\0';
+
+	if (!val[0] || !strcmp(val, "clear"))
+		return 0;
+	if (!strncmp(val, "set ", 4))
+		return hide_modules_list_check(val + 4);
+	if (!strncmp(val, "add ", 4) || !strncmp(val, "del ", 4)) {
+		arg = val + 4;
+		while (*arg == ' ')
+			arg++;
+		if (!*arg || strlen(arg) >= MODULE_NAME_LEN)
+			return -EINVAL;
+		/* parse_args runs before the table has a single name in it, so `del` here could only fail later
+		 * (-ENOENT, "not listed").  Reject it at the insmod instead - that is what it used to do. */
+		if (val[0] == 'd')
+			return -EINVAL;
+		return 0;
+	}
+	return hide_modules_list_check(val);
+}
+
 /* ---- the two frontends ---- */
 
 static int hide_modules_param_set(const char *val, const struct kernel_param *kp)
 {
-	/* insmod passes a bare value, so the parameter accepts a command-less list. */
-	return hide_modules_command(val, true);
+	int rc;
+
+	mutex_lock(&hide_syms_param_lock);
+	if (hide_syms_ready) {
+		mutex_unlock(&hide_syms_param_lock);
+		return hide_modules_command(val, true);	/* module is up: apply live */
+	}
+
+	/* parse_args(): validate the shape and cache the raw value - the command form is part of the
+	 * parameter's contract, so it is applied later with the same entry point (see
+	 * hide_modules_pending_val).  A typo still fails the insmod here.  Validate the value itself,
+	 * not a copy that was already truncated to the cache size. */
+	if (strlen(val) >= sizeof(hide_modules_pending_val)) {
+		mutex_unlock(&hide_syms_param_lock);
+		return -EINVAL;
+	}
+	strscpy(hide_modules_pending_val, val, sizeof(hide_modules_pending_val));
+	rc = hide_modules_check(hide_modules_pending_val);
+	if (!rc)
+		hide_modules_pending_given = true;
+	mutex_unlock(&hide_syms_param_lock);
+	return rc;
 }
 
 static int hide_modules_param_get(char *buf, const struct kernel_param *kp)
@@ -569,6 +663,25 @@ int susfs_hide_syms_init(void)
 	int rc;
 	unsigned long table_show;
 
+	/* Apply what the insmod parameter cached (see hide_modules_pending_val) FIRST, and before the
+	 * kprobe registrations below: those can fail without failing the load (this layer is non-fatal in
+	 * the layer table), and the operator's list must not be lost because of an unrelated probe.  The
+	 * import guard has passed by now, and sus_path is up (this layer is last), which is what the sysfs
+	 * rules need.  From here on the setter applies live. */
+	mutex_lock(&hide_syms_param_lock);
+	hide_syms_ready = true;
+	if (hide_modules_pending_given) {
+		rc = hide_modules_command(hide_modules_pending_val, true);
+		mutex_unlock(&hide_syms_param_lock);
+		if (rc) {
+			pr_err("susfs_hide_syms: applying hide_modules=\"%s\" from insmod failed %d\n",
+					hide_modules_pending_val, rc);
+			return rc;
+		}
+	} else {
+		mutex_unlock(&hide_syms_param_lock);
+	}
+
 	rc = register_kprobe(&kp_s_show);
 	if (rc) {
 		pr_warn("susfs_hide_syms: register_kprobe(s_show) failed %d\n", rc);
@@ -597,11 +710,10 @@ int susfs_hide_syms_init(void)
 	 * would be a trace upstream does not have.  The sysfs rule can only be registered now, because sus_path is up (this
 	 * layer is last in the init table).
 	 *
-	 * A list that is already populated came from the insmod parameter: module_param_cb()'s setter runs during
-	 * load_module()'s parse_args(), i.e. before module_init, so the operator's names are already committed and are
-	 * the whole point of the bare-list frontend.  Seeding the default over them here dropped every name the
-	 * operator gave (and unregistered the /sys/module rule the setter had just added).  Append our own name to
-	 * whatever is there instead, and only seed the default when nothing did. */
+	 * A list that is already populated came from the insmod parameter (applied at the top of this function):
+	 * module_param_cb()'s setter runs during load_module()'s parse_args(), i.e. before module_init, so the operator's
+	 * names are the whole point of the parameter.  Append our own name to whatever is there instead, and only seed the
+	 * default when nothing supplied a list. */
 	if (n_hide_modules == 0)
 		hide_modules_command(SUSFS_LKM_MODULE_NAME, true);
 	else
