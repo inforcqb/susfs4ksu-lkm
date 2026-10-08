@@ -1314,9 +1314,79 @@ static int sus_path_command(const char *val, int *removed_out)
     return 0;
 }
 
+/* ---- insmod parameters must not touch the guard-protected side ----
+ * module_param_cb()'s setters run during load_module()'s parse_args(), i.e. BEFORE susfs_init() has
+ * reached susfs_imports_guard() and before this layer is up.  Applying `hide_list=` or
+ * `sus_path_probe=` there reached sus_path_add_hidden_ex() -> kern_path()/ihold() and
+ * sus_path_hooks_arm() - imports the guard's table covers (imports_guard.c), so a loader that left
+ * one of them at zero jumped to address 0 before anything could refuse the load.  (That is not the
+ * whole import set: ordinary exports such as strscpy are the loader's and the build-time System.map
+ * gate's business, which is why the validation below may use them.)
+ *
+ * Both setters validate the shape and cache the raw value instead - hide_list's command form is part
+ * of its contract, so it is applied later through the same entry point - and sus_path_init() applies
+ * them once the guard has passed.  sus_path_ready marks the point after which they apply live, and
+ * sus_path_param_lock orders "cache" against "apply": a write landing between "ready = true" and the
+ * cached apply would otherwise be applied first and then overwritten by the older cached value.
+ *
+ * mutex_lock/mutex_unlock - in that table as well - are still reached from the pre-guard window on
+ * purpose, and that is not removable by a local change: the mutex is what orders the cache against
+ * the apply, and the other mutual-exclusion primitives available here (_raw_spin_lock*,
+ * __rcu_read_*) are in the same table.  Closing it needs a lock-free publication of the cached value
+ * (store, re-check the ready flag, apply live). */
+static char hide_list_pending[SUS_PATH_LEN + 16];
+static char sus_path_probe_pending[SUS_PATH_LEN];
+static bool hide_list_given;
+static bool sus_path_probe_given;
+static bool sus_path_ready;
+static DEFINE_MUTEX(sus_path_param_lock);
+
+/* hide_list's grammar: `clear`, `add <path>`, `del <path>` and nothing else - a bare value is
+ * refused, so a typo cannot silently replace the list.  Validation only: the command itself touches
+ * the table and arms the hooks, which is why it runs at init. */
+static int sus_path_command_check(const char *val)
+{
+	char cmd[SUS_PATH_LEN + 16];
+	const char *arg;
+	size_t i;
+
+	if (strlen(val) >= sizeof(cmd))
+		return -EINVAL;
+	strscpy(cmd, val, sizeof(cmd));
+	for (i = strlen(cmd); i > 0 && (cmd[i - 1] == '\n' || cmd[i - 1] == '\r' || cmd[i - 1] == ' '); i--)
+		cmd[i - 1] = '\0';
+
+	if (!strcmp(cmd, "clear"))
+		return 0;
+	if (strncmp(cmd, "add ", 4) && strncmp(cmd, "del ", 4))
+		return -EINVAL;
+	arg = cmd + 4;
+	while (*arg == ' ')
+		arg++;
+	return *arg ? 0 : -EINVAL;
+}
+
 static int sus_path_store_list(const char *val, const struct kernel_param *kp)
 {
-    return sus_path_command(val, NULL);
+	int rc;
+
+	mutex_lock(&sus_path_param_lock);
+	if (sus_path_ready) {
+		/* Same judgement as the pre-init path: a bad or over-long command is refused instead of
+		 * being silently truncated by sus_path_command(). */
+		rc = sus_path_command_check(val);
+		mutex_unlock(&sus_path_param_lock);
+		return rc ? rc : sus_path_command(val, NULL);
+	}
+
+	/* parse_args(): validate and cache only - see hide_list_pending. */
+	rc = sus_path_command_check(val);
+	if (!rc) {
+		strscpy(hide_list_pending, val, sizeof(hide_list_pending));
+		hide_list_given = true;
+	}
+	mutex_unlock(&sus_path_param_lock);
+	return rc;
 }
 
 static int sus_path_format_list(char *buf, size_t size)
@@ -1443,7 +1513,7 @@ module_param_cb(hide_list, &sus_path_list_ops, NULL, 0600);
 
 static char sus_path_probe_report[640];
 
-static int sus_path_probe_set(const char *val, const struct kernel_param *kp)
+static int sus_path_probe_apply(const char *val)
 {
     struct sus_path_entry *e;
     struct path p;
@@ -1496,6 +1566,21 @@ static int sus_path_probe_set(const char *val, const struct kernel_param *kp)
     }
     spin_unlock(&sus_path_lock);
     path_put(&p);
+    return 0;
+}
+
+static int sus_path_probe_set(const char *val, const struct kernel_param *kp)
+{
+    mutex_lock(&sus_path_param_lock);
+    if (sus_path_ready) {
+        mutex_unlock(&sus_path_param_lock);
+        return sus_path_probe_apply(val);
+    }
+
+    /* parse_args(): cache only - see hide_list_pending (the probe reads a path, nothing here does). */
+    strscpy(sus_path_probe_pending, val, sizeof(sus_path_probe_pending));
+    sus_path_probe_given = true;
+    mutex_unlock(&sus_path_param_lock);
     return 0;
 }
 
@@ -1601,6 +1686,11 @@ int sus_path_init(void)
     SUSFS_LOGI("sus_path: dirent rewrite rides the shared sys_exit tracepoint (no probe of its own)\n");
 
     if (no_extra) {
+        mutex_lock(&sus_path_param_lock);
+        if (hide_list_given || sus_path_probe_given)
+            pr_warn("sus_path: no_extra=1 - the hide_list/sus_path_probe value given at insmod is dropped (the LSM layer is off)\n");
+        sus_path_ready = true;	/* later writes behave exactly as before this change */
+        mutex_unlock(&sus_path_param_lock);
         SUSFS_LOGI("sus_path: no_extra=1 - the LSM layer and the dirent filter are OFF (isolation test)\n");
         return 0;
     }
@@ -1665,6 +1755,26 @@ int sus_path_init(void)
         SUSFS_LOGI("sus_path: /proc/susfs_path not created (expose_proc=%d lsm=%d)\n",
                 (int)susfs_expose_proc, (int)sus_path_lsm_active());
     }
+
+    /* Apply what the insmod parameters handed over (see hide_list_pending): the import guard has
+     * passed and this layer is up, so this is the first moment they can run for real.  From here on
+     * both setters apply live.  The lock is what makes "cached first, later writes after" hold: a
+     * write landing between ready = true and this apply would otherwise be overwritten by the older
+     * value (hide_list is append-only, but hide_modules' commit is not - same pattern in both). */
+    mutex_lock(&sus_path_param_lock);
+    sus_path_ready = true;
+    if (hide_list_given) {
+        rc = sus_path_command(hide_list_pending, NULL);
+        if (rc)
+            pr_warn("sus_path: applying hide_list=\"%s\" from insmod failed %d - that rule is not in effect\n",
+                    hide_list_pending, rc);
+    }
+    if (sus_path_probe_given) {
+        rc = sus_path_probe_apply(sus_path_probe_pending);
+        if (rc)
+            pr_warn("sus_path: sus_path_probe=\"%s\" from insmod failed %d\n", sus_path_probe_pending, rc);
+    }
+    mutex_unlock(&sus_path_param_lock);
     return 0;
 }
 
