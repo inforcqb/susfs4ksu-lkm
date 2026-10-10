@@ -13,13 +13,13 @@
  *     return ERR_PTR(-EINVAL);
  *
  * - and register_kprobe() stores the address it resolved BEFORE the checks that can still
- * fail it (`p->addr = addr;` sits above check_kprobe_rereg()/check_kprobe_address_safe()), so
+ * fail it (`p->addr = addr;` sits above warn_kprobe_rereg()/check_kprobe_address_safe()), so
  * the field is written even when the call returns an error.  unregister_kprobes() clears it
  * only for a probe that was never on a list:
  *
  *     for (i = 0; i < num; i++)
  *             if (__unregister_kprobe_top(kps[i]) < 0)
- *                     kps[i]->addr = NULL;    /* only on failure */
+ *                     kps[i]->addr = NULL;    (only on failure)
  *
  * which means a probe that DID arm keeps its address after it is removed.
  *
