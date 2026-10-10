@@ -1332,11 +1332,12 @@ static long sus_path_filter(unsigned long buf, long count,
 
         /* head_reclen is the first record's own length, read above with this ABI's layout; the
          * buffer still holds it untouched because written == 0 means nothing was moved.  The
-         * placeholder is only d_ino = 0 plus the empty name: everything else the record held
-         * (d_off, d_reclen, d_type and the name's tail - zeroing name[0] alone leaves the rest
-         * of "susfs_kstat" sitting there as "usfs_kstat"), and every record behind it, is
-         * cleared.  The hidden name has to be gone from the buffer, not merely invisible to a
-         * caller that honours the returned length. */
+         * placeholder is d_ino = 0 plus an empty name - and nothing else of the record is touched:
+         * d_off/d_reclen/d_type keep the values the kernel wrote, because readdir() needs them to
+         * walk on to the next record (clearing them would end the listing early).  What IS cleared
+         * is the name's tail - zeroing name[0] alone leaves the rest of "susfs_kstat" sitting there
+         * as "usfs_kstat" - and every record behind this one.  The hidden name has to be gone from
+         * the buffer, not merely invisible to a caller that honours the returned length. */
         if (head_reclen >= lay->name_off + 1 && head_reclen <= count &&
             !copy_to_user((void __user *)buf, zero_ino, lay->ino_size) &&
             !copy_to_user((void __user *)(buf + lay->name_off), &nul, 1) &&
@@ -1361,7 +1362,11 @@ static long sus_path_filter(unsigned long buf, long count,
     if (!failed && written < count &&
         clear_user((void __user *)(buf + written), count - written)) {
         /* A partially scrubbed tail still carries hidden names, so this chunk cannot be handed
-         * back as filtered: report it as untouched instead. */
+         * back as filtered: report the full length instead.  The chunk is not literally untouched
+         * - records that were moved down stay where they were moved, and the first record's
+         * d_ino/name may already have been rewritten by the placeholder attempt above - but the
+         * chain the caller parses is still the kernel's own and still walks, which is the property
+         * that matters. */
         atomic_inc(&n_dirent_rewrite_fail);
         pr_warn_ratelimited("sus_path: dirent tail scrub stopped at %ld/%ld bytes (returned %ld)\n",
                             written, count, count);
