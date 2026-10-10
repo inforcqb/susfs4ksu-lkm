@@ -1194,7 +1194,14 @@ static void sus_path_hooks_arm(void)
  * the bytes handed back whole, which is still a valid record chain the caller re-reads on its
  * next getdents64; and `count` when nothing was written back, i.e. "nothing was filtered" -
  * the old behaviour returned `count` with a *partially* compacted buffer, telling the caller
- * to parse bytes that were no longer records. */
+ * to parse bytes that were no longer records.
+ *
+ * Filtering only the prefix is not enough: getdents64 hands the caller a length, not a secret,
+ * so a process that ignores that length (or scans the whole buffer for names, which the
+ * module's own test tooling does) would still read a dropped name out of the bytes the chain
+ * no longer covers.  The tail past the compacted chain - and the tail of the placeholder
+ * record's name - is therefore zeroed before returning, so no hidden byte survives in the
+ * caller's buffer. */
 static long sus_path_filter(unsigned long buf, long count,
                             const struct sus_dirent_layout *lay)
 {
@@ -1318,22 +1325,46 @@ static long sus_path_filter(unsigned long buf, long count,
          * chunk.  So one record is left behind as a placeholder - d_ino = 0 with an empty
          * name.  readdir() skips records whose d_ino is 0 (bionic does), which makes the
          * caller ask again; a hand-written parser sees an entry without a name, still better
-         * than a directory that ends early.  The hidden name is gone either way. */
+         * than a directory that ends early. */
     if (!failed && count > 0 && written == 0) {
         char zero_ino[8] = {0};
         char nul = '\0';
 
         /* head_reclen is the first record's own length, read above with this ABI's layout; the
-         * buffer still holds it untouched because written == 0 means nothing was moved. */
+         * buffer still holds it untouched because written == 0 means nothing was moved.  The
+         * placeholder is only d_ino = 0 plus the empty name: everything else the record held
+         * (d_off, d_reclen, d_type and the name's tail - zeroing name[0] alone leaves the rest
+         * of "susfs_kstat" sitting there as "usfs_kstat"), and every record behind it, is
+         * cleared.  The hidden name has to be gone from the buffer, not merely invisible to a
+         * caller that honours the returned length. */
         if (head_reclen >= lay->name_off + 1 && head_reclen <= count &&
             !copy_to_user((void __user *)buf, zero_ino, lay->ino_size) &&
-            !copy_to_user((void __user *)(buf + lay->name_off), &nul, 1)) {
+            !copy_to_user((void __user *)(buf + lay->name_off), &nul, 1) &&
+            !clear_user((void __user *)(buf + lay->name_off + 1),
+                        head_reclen - lay->name_off - 1) &&
+            !clear_user((void __user *)(buf + head_reclen), count - head_reclen)) {
             atomic_inc(&n_dirent_all_hidden);
             return head_reclen;
         }
         /* Could not build the placeholder: filtering would be worse than not filtering, because the
          * caller would lose the chunk entirely. */
         atomic_inc(&n_dirent_rewrite_fail);
+        return count;
+    }
+
+    /* The dropped records are gone from the chain, but their bytes are still where they used to
+     * be - past `written` - together with the original copy of the records that were moved down.
+     * Whoever ignores the return value, or scans the buffer for names instead of walking it,
+     * reads a hidden name (and its d_ino/d_off) straight out of that tail.  Zero it.  This runs
+     * with the spinlock released and faults enabled, so a tail whose pages are not resident is
+     * still scrubbed rather than left behind. */
+    if (!failed && written < count &&
+        clear_user((void __user *)(buf + written), count - written)) {
+        /* A partially scrubbed tail still carries hidden names, so this chunk cannot be handed
+         * back as filtered: report it as untouched instead. */
+        atomic_inc(&n_dirent_rewrite_fail);
+        pr_warn_ratelimited("sus_path: dirent tail scrub stopped at %ld/%ld bytes (returned %ld)\n",
+                            written, count, count);
         return count;
     }
 
