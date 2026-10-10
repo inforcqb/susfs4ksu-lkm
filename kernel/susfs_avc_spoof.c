@@ -18,6 +18,7 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
+#include "susfs_kprobe.h"
 
 /* module_param overrides for the two domains: the default su domain is the SukiSU variant ("ksu"), stock
  * KernelSU uses "su".  The sid is resolved at init time via security_secctx_to_secid(). */
@@ -82,8 +83,13 @@ static int avc_register(void)
 	if (avc_registered)
 		return 0;
 	rc = register_kprobe(&kp_avc);
-	if (rc)
+	if (rc) {
+		/* The failure that matters is reported to the caller, but the address the kernel
+		 * resolved is already in the struct: without this the retry a later enable makes
+		 * would be refused with -EINVAL (see susfs_kprobe.h). */
+		susfs_kp_forget_addr(&kp_avc);
 		return rc;
+	}
 	avc_registered = true;
 	SUSFS_LOGI("susfs_avc_spoof: hook installed (slow_avc_audit)\n");
 	return 0;
@@ -94,6 +100,10 @@ static void avc_unregister(void)
 	if (!avc_registered)
 		return;
 	unregister_kprobe(&kp_avc);
+	/* A successful unregister leaves .addr set (only a probe that was never on a list gets it
+	 * cleared), so "disarmed" has to mean it here too: writing 0 and then 1 is the documented
+	 * way to restart the spoof, and it used to end with the hook permanently gone. */
+	susfs_kp_forget_addr(&kp_avc);
 	avc_registered = false;
 	SUSFS_LOGI("susfs_avc_spoof: hook removed\n");
 }
@@ -141,8 +151,13 @@ static ssize_t avc_proc_write(struct file *file, const char __user *buf,
 		return -EINVAL;
 	}
 
-	if (rc)
+	if (rc) {
 		pr_warn("avc_spoof: enable failed %d\n", rc);
+		/* Reported to the writer: a switch that did not take effect must not come back as a
+		 * complete write.  Success still returns len, the same contract kstat_proc_write()
+		 * states for its own commands. */
+		return rc;
+	}
 	return len;
 }
 
