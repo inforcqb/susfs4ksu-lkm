@@ -42,6 +42,7 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 
 /* KSTAT_SPOOF_* bits live in susfs_abi.h (upstream declares them in susfs.h next to struct
  * st_susfs_sus_kstat).  KSTAT_AUTO_SPOOF* below are /proc-interface masks, not supercall ABI. */
@@ -156,13 +157,15 @@ static_assert(offsetof(struct stat, st_ctime) == ST_CTIME_OFF, "stat.st_ctime");
  *
  * Upstream gates every sus_kstat read on susfs_is_current_proc_umounted_app(), exactly
  * (TIF_PROC_UMOUNTED && current_uid().val >= 10000).  KernelSU's setuid_hook sets that flag only
- * when SUSFS integration is compiled into the kernel, and this device's kernel has none (zero susfs
- * symbols in kallsyms) - so uid >= 10000 is the available proxy, the same one sus_path uses.
- * Without it the spoofing is visible to root too, wider than upstream.  Writers (supercall, /proc)
- * are configuration and stay ungated. */
+ * with the SUSFS integration compiled into the kernel, which this kernel has none of, so the flag
+ * is asked of KernelSU itself instead: susfs_is_current_proc_umounted_app() answers it with
+ * ksu_uid_should_umount() (ksu_umount_gate.h, issue #34).  The old `uid >= 10000` proxy spoofed for
+ * every app uid, the manager and su-granted apps included.
+ * Without any gate the spoofing would be visible to root too, wider than upstream.  Writers
+ * (supercall, /proc) are configuration and stay ungated. */
 static bool susfs_kstat_gate_ok(void)
 {
-	return current_uid().val >= 10000;
+	return susfs_is_current_proc_umounted_app();
 }
 
 /* ---- table access ----
