@@ -126,6 +126,7 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* module-wide declarations */
+#include "susfs_kprobe.h"
 
 /* ---- the "which mounts are ours" prefix list: state ----
  * Up here, not next to the control surface further down, because mount_stat() between
@@ -997,7 +998,7 @@ static int sus_mount_fdinfo_arm(void)
         rc = register_kretprobe(kr);
         if (rc) {
             pr_warn("sus_mount: register_kretprobe(seq_show @%px) failed %d\n", (void *)addrs[i], rc);
-            kr->kp.addr = NULL;
+            susfs_krp_forget_addr(kr);
             continue;
         }
         n_fdinfo_probes++;
@@ -1017,7 +1018,7 @@ static void sus_mount_fdinfo_disarm(void)
         if (!kr_fdinfo[i].kp.addr)
             continue;
         unregister_kretprobe(&kr_fdinfo[i]);
-        kr_fdinfo[i].kp.addr = NULL;
+        susfs_krp_forget_addr(&kr_fdinfo[i]);
     }
     n_fdinfo_probes = 0;
     kr_fdinfo_ok = false;
@@ -2056,6 +2057,12 @@ static void sus_mount_unregister(void)
         if (!sus_mount_show_armed[i])
             continue;
         unregister_kprobe(sus_mount_show_probes[i]);
+        /* Hand the struct back before the flag says it is disarmed: it was registered by
+         * .symbol_name, and the address the kernel resolved survives a successful
+         * unregister, so the next enable would be refused with -EINVAL - see
+         * susfs_kprobe.h.  This is the one path that made "hide, unhide, hide again" a
+         * one-way switch: the second hide armed nothing and reported -EINVAL. */
+        susfs_kp_forget_addr(sus_mount_show_probes[i]);
         sus_mount_show_armed[i] = false;
     }
     n_show_probes = 0;
@@ -2063,22 +2070,27 @@ static void sus_mount_unregister(void)
         sus_mount_fdinfo_disarm();
     if (kr_statx_ok) {
         unregister_kretprobe(&kr_statx);
+        susfs_krp_forget_addr(&kr_statx);
         kr_statx_ok = false;
     }
     if (kr_statx_do_ok) {
         unregister_kretprobe(&kr_statx_do);
+        susfs_krp_forget_addr(&kr_statx_do);
         kr_statx_do_ok = false;
     }
     if (kp_sb_down_ok) {
         unregister_kprobe(&kp_sb_down);
+        susfs_kp_forget_addr(&kp_sb_down);
         kp_sb_down_ok = false;
     }
     if (kr_clone_ns_ok) {
         unregister_kretprobe(&kr_clone_ns);
+        susfs_krp_forget_addr(&kr_clone_ns);
         kr_clone_ns_ok = false;
     }
     if (kr_newmnt_ok) {
         unregister_kretprobe(&kr_newmnt);
+        susfs_krp_forget_addr(&kr_newmnt);
         kr_newmnt_ok = false;
     }
     mount_registered = false;
@@ -2142,6 +2154,10 @@ static int sus_mount_register(void)
         if (rc) {
             pr_warn("sus_mount: register_kprobe(%s) failed %d - that file keeps showing our mounts\n",
                     sus_mount_show_names[i], rc);
+            /* A failure after address resolution leaves .addr set, so the retry a later enable
+             * performs has to find the struct clear or it is refused with -EINVAL without
+             * ever reaching the symbol again - see susfs_kprobe.h. */
+            susfs_kp_forget_addr(sus_mount_show_probes[i]);
             continue;
         }
         sus_mount_show_armed[i] = true;
@@ -2161,12 +2177,14 @@ static int sus_mount_register(void)
         pr_warn("sus_mount: the fdinfo probe could not be armed %d - /proc/<pid>/fdinfo keeps printing the real mnt_id\n", rc);
     rc = register_kretprobe(&kr_statx);
     if (rc) {
+        susfs_krp_forget_addr(&kr_statx);
         pr_warn("sus_mount: register_kretprobe(__arm64_sys_statx) failed %d - statx keeps returning the real stx_mnt_id\n", rc);
     } else {
         kr_statx_ok = true;
     }
     rc = register_kretprobe(&kr_statx_do);
     if (rc) {
+        susfs_krp_forget_addr(&kr_statx_do);
         pr_warn("sus_mount: register_kretprobe(do_statx) failed %d - the second statx landing point is not armed\n", rc);
     } else {
         kr_statx_do_ok = true;
@@ -2176,30 +2194,36 @@ static int sus_mount_register(void)
      * reused (measured).  A missing symbol means records can outlive their fs and
      * falsely match another one, so say so instead of quietly degrading. */
     rc = register_kprobe(&kp_sb_down);
-    if (rc)
+    if (rc) {
+        susfs_kp_forget_addr(&kp_sb_down);
         pr_warn("sus_mount: register_kprobe(generic_shutdown_super) failed %d - records are NOT dropped when their filesystem is unmounted, a reused s_dev can match an unrelated mount\n",
                 rc);
-    else
+    } else {
         kp_sb_down_ok = true;
+    }
     /* Optional as well: without it a namespace copied after the enable keeps
      * working for the mount TABLE (identity hides the lines) but fdinfo/statx stay
      * inconsistent until somebody reads a mount table in that namespace. */
     rc = register_kretprobe(&kr_clone_ns);
-    if (rc)
+    if (rc) {
+        susfs_krp_forget_addr(&kr_clone_ns);
         pr_warn("sus_mount: register_kretprobe(copy_mnt_ns) failed %d - ids of mounts in a namespace copied later are only learned when its mount table is read\n",
                 rc);
-    else
+    } else {
         kr_clone_ns_ok = true;
+    }
     /* And the mount-time registration, which is what covers a filesystem mounted while
      * the module is already up (see the note above kr_newmnt).  Also optional in the
      * sense that hiding keeps working for everything the scan saw - but without it a
      * mount that appears later is not hidden anywhere, so a failure is reported. */
     rc = register_kretprobe(&kr_newmnt);
-    if (rc)
+    if (rc) {
+        susfs_krp_forget_addr(&kr_newmnt);
         pr_warn("sus_mount: register_kretprobe(attach_recursive_mnt) failed %d - a mount created after the enable is NOT hidden (not marked, no identity recorded)\n",
                 rc);
-    else
+    } else {
         kr_newmnt_ok = true;
+    }
     mount_registered = true;
     mutex_unlock(&sus_mount_ctl_lock);
     return 0;

@@ -48,6 +48,7 @@
 #include "susfs.h"		/* susfs_expose_proc, sus_path_lsm_active */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
+#include "susfs_kprobe.h"
 
 #define SUS_OR_MAX 64
 /* The ABI fields are char[256]; matching that width stops a legal long path from being truncated into a rule for a
@@ -641,8 +642,13 @@ static int or_register(void)
 	if (or_registered)
 		return 0;
 	rc = register_kprobe(&kp_or);
-	if (rc)
+	if (rc) {
+		/* Every later rule retries this registration, and a failure that happened after the
+		 * symbol was resolved leaves .addr set, so the retry would be refused with -EINVAL
+		 * and the forward hook - the feature - could never come up - see susfs_kprobe.h. */
+		susfs_kp_forget_addr(&kp_or);
 		return rc;
+	}
 	or_registered = true;
 	SUSFS_LOGI("susfs_open_redirect: hook installed (vfs_open)\n");
 	return 0;
@@ -658,10 +664,11 @@ static void or_register_reverse(void)
 
 	if (!or_dpath_registered) {
 		rc = register_kprobe(&kp_or_dpath);
-		if (rc)
+		if (rc) {
+			susfs_kp_forget_addr(&kp_or_dpath);
 			pr_warn("open_redirect: register_kprobe(d_path) failed %d - readlink not disguised (or already inlined)\n",
 				rc);
-		else {
+		} else {
 			or_dpath_registered = true;
 			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (d_path)\n");
 		}
@@ -669,30 +676,33 @@ static void or_register_reverse(void)
 
 	if (!or_statfs_registered) {
 		rc = register_kprobe(&kp_or_vfs_statfs);
-		if (rc)
+		if (rc) {
+			susfs_kp_forget_addr(&kp_or_vfs_statfs);
 			pr_warn("open_redirect: register_kprobe(vfs_statfs) failed %d - statfs not disguised (or already inlined)\n",
 				rc);
-		else {
+		} else {
 			or_statfs_registered = true;
 			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (vfs_statfs)\n");
 		}
 	}
 	if (!or_maps_registered) {
 		rc = register_kretprobe(&kr_or_maps);
-		if (rc)
+		if (rc) {
+			susfs_krp_forget_addr(&kr_or_maps);
 			pr_warn("open_redirect: register_kretprobe(show_map_vma) failed %d - the maps dev:ino stays the redirected file's\n",
 				rc);
-		else {
+		} else {
 			or_maps_registered = true;
 			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (show_map_vma)\n");
 		}
 	}
 	if (!or_fdinfo_registered) {
 		rc = register_kretprobe(&kr_or_fdinfo);
-		if (rc)
+		if (rc) {
+			susfs_krp_forget_addr(&kr_or_fdinfo);
 			pr_warn("open_redirect: register_kretprobe(seq_show) failed %d - fdinfo names the redirected inode\n",
 				rc);
-		else {
+		} else {
 			or_fdinfo_registered = true;
 			SUSFS_LOGI("susfs_open_redirect: reverse hook installed (seq_show/fdinfo)\n");
 		}
@@ -703,24 +713,29 @@ static void or_unregister(void)
 {
 	if (or_fdinfo_registered) {
 		unregister_kretprobe(&kr_or_fdinfo);
+		susfs_krp_forget_addr(&kr_or_fdinfo);
 		or_fdinfo_registered = false;
 	}
 	if (or_maps_registered) {
 		unregister_kretprobe(&kr_or_maps);
+		susfs_krp_forget_addr(&kr_or_maps);
 		or_maps_registered = false;
 	}
 	if (or_statfs_registered) {
 		unregister_kprobe(&kp_or_vfs_statfs);
+		susfs_kp_forget_addr(&kp_or_vfs_statfs);
 		or_statfs_registered = false;
 	}
 	if (or_dpath_registered) {
 		unregister_kprobe(&kp_or_dpath);
+		susfs_kp_forget_addr(&kp_or_dpath);
 		or_dpath_registered = false;
 	}
 
 	if (!or_registered)
 		return;
 	unregister_kprobe(&kp_or);
+	susfs_kp_forget_addr(&kp_or);
 	or_registered = false;
 	SUSFS_LOGI("susfs_open_redirect: hook removed\n");
 }

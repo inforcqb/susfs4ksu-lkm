@@ -43,6 +43,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc */
 #include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
+#include "susfs_kprobe.h"
 
 /* KSTAT_SPOOF_* bits live in susfs_abi.h (upstream declares them in susfs.h next to struct
  * st_susfs_sus_kstat).  KSTAT_AUTO_SPOOF* below are /proc-interface masks, not supercall ABI. */
@@ -424,10 +425,16 @@ static void kstat_maps_arm(void)
 	if (kstat_maps_registered)
 		return;
 	rc = register_kretprobe(&krp_kstat_map_vma);
-	if (rc)
+	if (rc) {
+		/* Every later rule operation retries this arming (kstat_maps_arm() is called from
+		 * the add/update/clear paths and from the supercall), so the struct has to come back
+		 * clear: a failure that happened after the symbol was resolved leaves .addr set, and
+		 * the retry would be refused with -EINVAL instead of trying again - see
+		 * susfs_kprobe.h. */
+		susfs_krp_forget_addr(&krp_kstat_map_vma);
 		pr_warn("susfs_kstat: register_kretprobe(show_map_vma) failed %d - maps keeps printing the real dev:ino\n",
 			rc);
-	else {
+	} else {
 		kstat_maps_registered = true;
 		SUSFS_LOGI("susfs_kstat: maps hook armed (kretprobe show_map_vma)\n");
 	}
@@ -438,6 +445,7 @@ static void kstat_maps_disarm(void)
 	if (!kstat_maps_registered)
 		return;
 	unregister_kretprobe(&krp_kstat_map_vma);
+	susfs_krp_forget_addr(&krp_kstat_map_vma);
 	kstat_maps_registered = false;
 }
 
@@ -1185,10 +1193,12 @@ int susfs_kstat_init(void)
 		kstat_tp_registered = true;
 
 	rc = register_kretprobe(&krp_vfs_getattr);
-	if (rc)
+	if (rc) {
+		susfs_krp_forget_addr(&krp_vfs_getattr);
 		pr_warn("register_kretprobe(vfs_getattr) failed %d\n", rc);
-	else
+	} else {
 		kstat_krp_registered = true;
+	}
 
 	/* 0777 is deliberate, not an oversight.  inode_permission() runs the DAC check BEFORE
 	 * security_inode_permission(), so a node the app cannot open hands it EACCES - "this exists,
@@ -1217,6 +1227,7 @@ void susfs_kstat_exit(void)
 	kstat_maps_disarm();
 	if (kstat_krp_registered) {
 		unregister_kretprobe(&krp_vfs_getattr);
+		susfs_krp_forget_addr(&krp_vfs_getattr);
 		kstat_krp_registered = false;
 	}
 	if (kstat_tp_registered) {
