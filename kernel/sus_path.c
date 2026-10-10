@@ -51,6 +51,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for optional compat probes */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 
 #include "lsm_hook.h"
 
@@ -273,9 +274,12 @@ static atomic_t sus_path_pend_logged_rc = ATOMIC_INIT(1);   /* rc already report
  * Defined up here because every decision layer below asks the same question. */
 
 /* Upstream gates on susfs_is_current_proc_umounted_app() && is_i_uid_not_allowed(): only app
- * processes, and never a file owned by the caller.  TIF_PROC_UMOUNTED is a SUSFS-specific thread
- * flag this LKM does not have, so uid >= 10000 is the proxy.  hide_from_apps=0 applies the hidden
- * set to every process including root - handy when testing from an adb shell. */
+ * processes KernelSU would umount modules for, and never a file owned by the caller.  TIF_PROC_
+ * UMOUNTED is a SUSFS-specific thread flag this LKM cannot set, so the first half is KernelSU's
+ * own answer asked directly (susfs_is_current_proc_umounted_app(), ksu_umount_gate.h).  Hiding from
+ * every `uid >= 10000` - manager and su-granted apps included - was issue #34.
+ * hide_from_apps=0 applies the hidden set to every process including root - handy when testing from
+ * an adb shell. */
 static int hide_from_apps = 1;
 module_param(hide_from_apps, int, 0644);
 
@@ -285,7 +289,7 @@ static inline bool sus_path_gate_uid_ok(void)
 {
     if (!hide_from_apps)
         return true;
-    return current_uid().val >= 10000;
+    return susfs_is_current_proc_umounted_app();
 }
 
 /* Full upstream gate for the LSM layer: app process, and the file is not owned by the caller
@@ -296,13 +300,13 @@ static inline bool sus_path_gate_ok(struct inode *inode)
 {
     if (!hide_from_apps)
         return true;
-    if (current_uid().val < 10000)
+    if (!susfs_is_current_proc_umounted_app())
         return false;
     return current_uid().val != inode->i_uid.val;
 }
 
 /* Per-rule gate.  A self_protect rule is one of this module's own control nodes, which must be
- * invisible to EVERY non-root caller: the ordinary gate is uid >= 10000, so a probe running as
+ * invisible to EVERY non-root caller: the ordinary gate needs an app uid, so a probe running as
  * system (1000) or shell (2000) would read /proc/susfs_kstat straight out of the listing - exactly
  * the trace this module exists to avoid.  Root keeps access to manage the module; ordinary rules
  * keep the upstream semantics untouched. */

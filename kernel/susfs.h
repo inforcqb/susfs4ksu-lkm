@@ -57,7 +57,7 @@ long sus_path_dirent_filter(int lay_id, unsigned long buf, long ret);
 bool susfs_kstat_tracepoint_armed(void);
 
 /* Same, for one of this module's own control nodes: flagged so the gate hides it from EVERY non-root caller, not merely
- * from apps (uid>=10000) - otherwise a probe running as system (1000) or shell (2000) reads the node name out of /proc. */
+ * from app processes - otherwise a probe running as system (1000) or shell (2000) reads the node name out of /proc. */
 int sus_path_add_self_hidden(const char *path);
 
 /* Undo sus_path_add_self_hidden(): drops the rule for @path and restores whatever it changed (the relaxed mode, the inode

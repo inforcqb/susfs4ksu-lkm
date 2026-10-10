@@ -15,7 +15,7 @@
  * seq_show() (mnt_id + ino) patch:1145-1217, show_map_vma() (maps dev:ino + name) patch:1257-1288, vfs_statfs()
  * (statfs/fstatfs) patch:2038-2056.  Gate: SUSFS_IS_INODE_OPEN_REDIRECT (susfs_def.h:148-151) = inode flag *and*
  * susfs_is_current_proc_umounted_app(), never the rule's uid_scheme - so even a scheme-0 rule is disguised for app
- * processes (or_reverse_visible() keeps that gate with uid >= 10000).
+ * processes (or_reverse_visible() keeps that gate through susfs_is_current_proc_umounted_app()).
  * Reachability: none of those five is reachable from an LKM here (the first two and seq_show() are static; the
  * maps/fdinfo numbers are locals a kprobe cannot see).  Covered instead: point the caller at the *target's* path
  * (d_path(), vfs_statfs()), and where no shared helper exists rewrite the line the function already formatted, from a
@@ -47,6 +47,7 @@
 #include "susfs_log.h"
 #include "susfs.h"		/* susfs_expose_proc, sus_path_lsm_active */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 
 #define SUS_OR_MAX 64
 /* The ABI fields are char[256]; matching that width stops a legal long path from being truncated into a rule for a
@@ -62,9 +63,9 @@
 #define FUSE_SUPER_MAGIC 0x65735546
 #endif
 
-/* Upstream's app threshold: susfs_is_current_proc_umounted_app() is (TIF_PROC_UMOUNTED && current_uid().val >= 10000)
- * (susfs_def.h:122-125); the uid half is the part this kernel can answer. */
-#define OR_APP_UID_MIN 10000
+/* Upstream's app threshold (susfs_def.h:122-125: TIF_PROC_UMOUNTED && current_uid().val >= 10000) is not a macro any
+ * more: both gates that used it now go through susfs_is_current_proc_umounted_app(), whose uid half is that same literal
+ * 10000 (ksu_umount_gate.h) and whose other half is KernelSU's answer. */
 
 /* SELinux context of the su/ksu domain, resolved to a sid at init.  Upstream gets the sid from KernelSU itself
  * (susfs_set_sid(KERNEL_SU_CONTEXT, &susfs_ksu_sid), 10_enable_susfs_for_ksu.patch:2496); an LKM has to resolve the
@@ -153,11 +154,12 @@ static __nocfi bool or_in_su_domain(void)
 }
 
 /* Upstream's reverse-disguise gate, verbatim in shape: SUSFS_IS_INODE_OPEN_REDIRECT (susfs_def.h:148-151) = flag bit AND
- * susfs_is_current_proc_umounted_app().  TIF_PROC_UMOUNTED is never set on this kernel (no SUSFS integration in it, and
- * nothing calls ksu_handle_setresuid), so uid >= 10000 is the proxy, as in sus_path / sus_kstat. */
+ * susfs_is_current_proc_umounted_app().  TIF_PROC_UMOUNTED is set by the SUSFS-patched KernelSU, which this kernel does not
+ * have, so the app half is KernelSU's own ksu_uid_should_umount() answer (ksu_umount_gate.h, issue #34) rather than the
+ * `uid >= 10000` proxy that also covered the manager and su-granted apps. */
 static bool or_reverse_visible(void)
 {
-	return current_uid().val >= OR_APP_UID_MIN;
+	return susfs_is_current_proc_umounted_app();
 }
 
 /* uid_scheme decision, mirroring upstream's switch in susfs_open_redirect_spoof_do_sys_openat() (susfs.c:941-964). */
@@ -172,10 +174,11 @@ static bool or_uid_matches(int scheme)
 		return !or_in_su_domain();
 	case UID_UMOUNTED_APP_PROC:		/* susfs.c:954-957 */
 	case UID_UMOUNTED_PROC:			/* susfs.c:958-961 */
-		/* Upstream: test_thread_flag(TIF_PROC_UMOUNTED) [&& uid >= 10000 for the _APP variant] (susfs_def.h:98-125).  This
-		 * kernel never sets that flag, so uid >= 10000 stands in - schemes 3 and 4 degenerate into the same predicate
-		 * here, a strictly narrower gate than scheme 2, and the substitute sus_path / sus_kstat also use. */
-		return current_uid().val >= OR_APP_UID_MIN;
+		/* Upstream: test_thread_flag(TIF_PROC_UMOUNTED) [&& uid >= 10000 for the _APP variant] (susfs_def.h:98-125).  The
+		 * flag is set by the SUSFS-patched KernelSU, so both schemes ask KernelSU the same question here
+		 * (susfs_is_current_proc_umounted_app(), ksu_umount_gate.h, issue #34) and still degenerate into one predicate - a
+		 * strictly narrower gate than scheme 2, as upstream's flag is. */
+		return susfs_is_current_proc_umounted_app();
 	default:				/* susfs.c:962-963 */
 		return false;
 	}

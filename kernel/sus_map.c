@@ -26,6 +26,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for the walk ops */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 
 #define SUS_MAP_MAX 64
 
@@ -93,15 +94,15 @@ static bool sus_map_lookup(unsigned long ino, dev_t dev)
 /* ---- the read gate ----
  *
  * Upstream hides behind SUSFS_IS_INODE_SUS_MAP() -> susfs_is_current_proc_umounted_app()
- * = (test_thread_flag(TIF_PROC_UMOUNTED) && current_uid().val >= 10000): apps only, so
- * root/init see the real mapping.  TIF_PROC_UMOUNTED cannot be reproduced in this LKM
- * (KernelSU sets it only with the SUSFS integration compiled into the kernel, which this
- * device's kernel is not), so uid >= 10000 is the project-wide proxy,
- * as in susfs_kstat_gate_ok() (susfs_kstat.c, commit 543b369) and sus_path.
+ * = (test_thread_flag(TIF_PROC_UMOUNTED) && current_uid().val >= 10000): apps only - and only the
+ * ones KernelSU umounts modules for - so root/init and a su-granted app see the real mapping.
+ * TIF_PROC_UMOUNTED is set by the SUSFS-patched KernelSU, which this LKM is not, so the same
+ * question is put to KernelSU directly (ksu_umount_gate.h, issue #34); the plain `uid >= 10000`
+ * proxy this replaces hid from the manager and from su-granted apps too.
  * Configuration stays ungated: the supercall and map_ino are rule management. */
 static bool sus_map_gate_ok(void)
 {
-    return current_uid().val >= 10000;
+    return susfs_is_current_proc_umounted_app();
 }
 
 /* One handler for show_map_vma (maps) and show_smap (smaps) - both are seq_operations

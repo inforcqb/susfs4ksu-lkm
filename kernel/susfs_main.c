@@ -9,6 +9,7 @@
 
 #include "symbol_resolver.h"
 #include "susfs_log.h"
+#include "ksu_umount_gate.h"
 #include "lsm_hook.h"
 #include "susfs.h"
 
@@ -92,6 +93,10 @@ static struct {
     bool fatal;
     bool armed;			/* exit is run for every layer that was attempted */
 } susfs_layers[] = {
+    /* First, and FATAL: the gates have to know which environment loaded this module before any
+     * feature can run (issue #34); a wrong answer here is a call to a zero address, so the layer
+     * refuses the load instead of degrading. */
+    { "ksu_umount_gate", susfs_ksu_umount_gate_init,	NULL,			true,  false },
     { "lsm_hook",	layer_lsm_hook_init,		ksu_lsm_hook_exit,	false, false },
     { "sus_path",	sus_path_init,			sus_path_exit,		true,  false },
     { "uname",		susfs_uname_init,		susfs_uname_exit,	false, false },
