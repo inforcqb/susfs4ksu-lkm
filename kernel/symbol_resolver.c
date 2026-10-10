@@ -195,6 +195,19 @@ unsigned long __nocfi find_kernel_symbol_exact(const char *symbol_name)
     return 0;
 }
 
+/* Raw name lookup through the bootstrapped kallsyms_lookup_name(), for names the KERNEL does not
+ * own: its implementation ends in module_kallsyms_lookup_name(), so a symbol provided by
+ * kernelsu.ko is found too - which is why find_kernel_symbol_exact() (module owners refused) is not
+ * the tool for callers that need exactly that.  0 = unknown name, or the resolver is not up; never
+ * sleeps.  __nocfi because the call goes through the resolver's function pointer. */
+unsigned long __nocfi ksu_kallsyms_lookup_name(const char *name)
+{
+    if (!name || !name[0] || unlikely(!kallsyms_lookup_name_fn))
+        return 0;
+
+    return kallsyms_lookup_name_fn(name);
+}
+
 int __nocfi ksu_find_symbol_all(const char *name, unsigned long *addrs, int max)
 {
     int n = 0;

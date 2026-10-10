@@ -28,6 +28,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for optional compat probes */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 
 #include "lsm_hook.h"
 
@@ -206,6 +207,11 @@ static atomic_t sus_path_pend_lost = ATOMIC_INIT(0);        /* walk ok, rule gon
 static atomic_t sus_path_pend_last_rc = ATOMIC_INIT(0);     /* last walk result */
 static atomic_t sus_path_pend_logged_rc = ATOMIC_INIT(1);   /* rc already reported */
 
+/* Upstream gates on susfs_is_current_proc_umounted_app() && is_i_uid_not_allowed(): only app
+ * processes KernelSU would umount modules for, and never a file owned by the caller.  Hiding from
+ * every `uid >= 10000` - the manager and su-granted apps included - was issue #34.
+ * hide_from_apps=0 applies the hidden set to every process including root - handy when testing from
+ * an adb shell. */
 static int hide_from_apps = 1;
 module_param(hide_from_apps, int, 0644);
 
@@ -213,14 +219,14 @@ static inline bool sus_path_gate_uid_ok(void)
 {
     if (!hide_from_apps)
         return true;
-    return current_uid().val >= 10000;
+    return susfs_is_current_proc_umounted_app();
 }
 
 static inline bool sus_path_gate_ok(struct inode *inode)
 {
     if (!hide_from_apps)
         return true;
-    if (current_uid().val < 10000)
+    if (!susfs_is_current_proc_umounted_app())
         return false;
     return current_uid().val != inode->i_uid.val;
 }

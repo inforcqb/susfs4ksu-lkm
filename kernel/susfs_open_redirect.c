@@ -19,6 +19,7 @@
 #include "susfs_log.h"
 #include "susfs.h"		/* susfs_expose_proc, sus_path_lsm_active */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 
 #define SUS_OR_MAX 64
 
@@ -30,7 +31,9 @@
 #define FUSE_SUPER_MAGIC 0x65735546
 #endif
 
-#define OR_APP_UID_MIN 10000
+/* Upstream's app threshold (susfs_def.h:122-125: TIF_PROC_UMOUNTED && current_uid().val >= 10000) is not a macro any
+ * more: both gates that used it go through susfs_is_current_proc_umounted_app(), whose uid half is that literal 10000
+ * (ksu_umount_gate.h) and whose other half is KernelSU's answer. */
 
 static char or_su_ctx[128] = "u:r:ksu:s0";
 module_param_string(or_su_ctx, or_su_ctx, sizeof(or_su_ctx), 0644);
@@ -94,9 +97,13 @@ static __nocfi bool or_in_su_domain(void)
 	return sid == or_su_sid;
 }
 
+/* Upstream's reverse-disguise gate, verbatim in shape: SUSFS_IS_INODE_OPEN_REDIRECT (susfs_def.h:148-151) = flag bit AND
+ * susfs_is_current_proc_umounted_app().  TIF_PROC_UMOUNTED is set by the SUSFS-patched KernelSU, which this kernel does not
+ * have, so the app half is KernelSU's own ksu_uid_should_umount() answer (ksu_umount_gate.h, issue #34) rather than the
+ * `uid >= 10000` proxy that also covered the manager and su-granted apps. */
 static bool or_reverse_visible(void)
 {
-	return current_uid().val >= OR_APP_UID_MIN;
+	return susfs_is_current_proc_umounted_app();
 }
 
 /* uid_scheme decision, mirroring upstream's switch in susfs_open_redirect_spoof_do_sys_openat() (susfs.c:941-964). */
@@ -111,8 +118,11 @@ static bool or_uid_matches(int scheme)
 		return !or_in_su_domain();
 	case UID_UMOUNTED_APP_PROC:		/* susfs.c:954-957 */
 	case UID_UMOUNTED_PROC:			/* susfs.c:958-961 */
-
-		return current_uid().val >= OR_APP_UID_MIN;
+		/* Upstream: test_thread_flag(TIF_PROC_UMOUNTED) [&& uid >= 10000 for the _APP variant] (susfs_def.h:98-125).  The
+		 * flag is set by the SUSFS-patched KernelSU, so both schemes ask KernelSU the same question here
+		 * (susfs_is_current_proc_umounted_app(), ksu_umount_gate.h, issue #34) and still degenerate into one predicate - a
+		 * strictly narrower gate than scheme 2, as upstream's flag is. */
+		return susfs_is_current_proc_umounted_app();
 	default:				/* susfs.c:962-963 */
 		return false;
 	}

@@ -21,6 +21,7 @@
 #include "susfs_abi.h"
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_expose_proc, sus_path_dirent_filter() */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 
 #define KSTAT_AUTO_SPOOF (KSTAT_SPOOF_INO | KSTAT_SPOOF_DEV | \
 	KSTAT_SPOOF_ATIME_TV_SEC | KSTAT_SPOOF_ATIME_TV_NSEC | \
@@ -119,9 +120,17 @@ static_assert(offsetof(struct stat, st_atime) == ST_ATIME_OFF, "stat.st_atime");
 static_assert(offsetof(struct stat, st_mtime) == ST_MTIME_OFF, "stat.st_mtime");
 static_assert(offsetof(struct stat, st_ctime) == ST_CTIME_OFF, "stat.st_ctime");
 
+/* Upstream gates every sus_kstat read on susfs_is_current_proc_umounted_app(), exactly
+ * (TIF_PROC_UMOUNTED && current_uid().val >= 10000).  KernelSU's setuid_hook sets that flag only
+ * with the SUSFS integration compiled into the kernel, which this kernel has none of, so the flag
+ * is asked of KernelSU itself instead: susfs_is_current_proc_umounted_app() answers it with
+ * ksu_uid_should_umount() (ksu_umount_gate.h, issue #34).  The old `uid >= 10000` proxy spoofed for
+ * every app uid - the manager and su-granted apps included.
+ * Without any gate the spoofing would be visible to root too, wider than upstream.  Writers
+ * (supercall, /proc) are configuration and stay ungated. */
 static bool susfs_kstat_gate_ok(void)
 {
-	return current_uid().val >= 10000;
+	return susfs_is_current_proc_umounted_app();
 }
 
 static bool susfs_kstat_table_empty(void)
@@ -368,7 +377,7 @@ struct kstat_call_counters {
 	atomic_t no_buf;	/* statbuf argument was NULL */
 	atomic_t rewrite;	/* the buffer really changed */
 	atomic_t miss_empty;	/* no rule registered at all */
-	atomic_t miss_gate;	/* gate: uid < 10000 (not an app) */
+	atomic_t miss_gate;	/* gate: not an app process KernelSU would umount modules for */
 	atomic_t miss_lookup;	/* the (ino,dev) key matched no rule */
 	atomic_t match_noflag;	/* matched, but this buffer has no field we impersonate */
 	atomic_t uaccess;	/* copy_from_user/copy_to_user failed */

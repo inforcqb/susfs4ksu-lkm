@@ -16,6 +16,7 @@
 #include "susfs_log.h"
 #include "susfs.h"	/* susfs_abi_path_ok */
 #include "symbol_resolver.h"	/* find_kernel_symbol_exact, for the walk ops */
+#include "ksu_umount_gate.h"	/* susfs_is_current_proc_umounted_app (issue #34) */
 
 #define SUS_MAP_MAX 64
 
@@ -74,9 +75,14 @@ static bool sus_map_lookup(unsigned long ino, dev_t dev)
     return false;
 }
 
+/* Upstream's read gate is SUSFS_IS_INODE_SUS_MAP() -> susfs_is_current_proc_umounted_app(): apps
+ * only, and only the ones KernelSU umounts modules for, so root/init and a su-granted app see the
+ * real mapping.  The plain `uid >= 10000` proxy this replaces hid from the manager and from
+ * su-granted apps too (issue #34).  Configuration stays ungated: the supercall and map_ino are rule
+ * management. */
 static bool sus_map_gate_ok(void)
 {
-    return current_uid().val >= 10000;
+    return susfs_is_current_proc_umounted_app();
 }
 
 static int sus_map_skip_vma_pre(struct kprobe *kp, struct pt_regs *regs)

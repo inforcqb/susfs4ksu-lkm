@@ -322,6 +322,68 @@ typedef char assert_ehdr_size[(sizeof(struct elf64_ehdr) == 64) ? 1 : -1];
 typedef char assert_shdr_size[(sizeof(struct elf64_shdr) == 64) ? 1 : -1];
 typedef char assert_sym_size[(sizeof(struct elf64_sym) == 24) ? 1 : -1];
 
+/* ---- environment: is this load a KernelSU one? ---- */
+
+#define KSU_DOMAIN_PREFIX	"u:r:ksu"
+
+/* The KernelSU gate symbol of the module (kernel/ksu_umount_gate.c, issue #34).  It belongs to
+ * kernelsu.ko and is not exported, so on a KernelSU device it resolves below like every other
+ * name; everywhere else there is no such symbol and it has to be stood in for - see the pin step
+ * after the rewrite pass. */
+static const char ksu_gate_symbol[] = "ksu_uid_should_umount";
+
+/* What is_ksu_domain() read, kept for the messages below. */
+static char current_domain[128];
+
+/* Which environment this load belongs to, read from the loading process itself: KernelSU's own
+ * loader is ksud, and it runs in u:r:ksu:s0, while Magisk and APatch run their scripts (and their
+ * su) in their own domains, none of which is a ksu one.  So the question is "am I in u:r:ksu*",
+ * and /proc/self/attr/current answers it without any SELinux API in a freestanding tool.
+ *
+ * The prefix is deliberately loose (u:r:ksu, u:r:ksu_exec and friends all count as KernelSU):
+ * guessing KernelSU is the safe direction, because it means the symbol has to resolve and a
+ * missing one fails the load loudly instead of silently keeping the pre-#34 rule.  Unreadable
+ * counts as "not KernelSU", i.e. the same as any other non-KernelSU root context. */
+static int is_ksu_domain(void)
+{
+	static char buf[128];
+	sysarg fd, n;
+	u64 i;
+
+	fd = sys6(SYS_openat, AT_FDCWD, (sysarg)"/proc/self/attr/current", O_RDONLY, 0, 0, 0);
+	if (fd < 0)
+		return 0;
+	n = sys6(SYS_read, fd, (sysarg)buf, (sysarg)sizeof(buf) - 1, 0, 0, 0);
+	sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+	if (n <= 0)
+		return 0;
+	buf[n] = 0;
+	copy_n(current_domain, buf, (u64)n);
+	current_domain[n] = 0;
+
+	for (i = 0; KSU_DOMAIN_PREFIX[i]; i++) {
+		if (buf[i] != KSU_DOMAIN_PREFIX[i])
+			return 0;
+	}
+	return 1;
+}
+
+/* The second, independent hint that this device is a KernelSU one: its module directory.  Some
+ * KernelSU builds hide it - measured on the project's device, /sys/module/kernelsu does not exist
+ * even while /proc/modules lists a live `kernelsu` - which is exactly why the domain above is the
+ * other half of this test.  Either one saying "KernelSU" is enough (see the gate symbol below). */
+#define KSU_SYSFS_DIR	"/sys/module/kernelsu"
+
+static int kernelsu_sysfs_present(void)
+{
+	sysarg fd = sys6(SYS_openat, AT_FDCWD, (sysarg)KSU_SYSFS_DIR, O_RDONLY, 0, 0, 0);
+
+	if (fd < 0)
+		return 0;
+	sys6(SYS_close, fd, 0, 0, 0, 0, 0);
+	return 1;
+}
+
 #define MAX_UNDEF 4096
 #define MAX_LISTED 10
 
@@ -696,6 +758,9 @@ void insmod_main(long argc, char **argv)
 	u64 u, nsyms, i;
 	u32 resolved = 0, unresolved = 0, unresolved_weak = 0, unresolved_hard = 0;
 	u32 listed = 0, bad_sym = 0;
+	u32 gate_pinned = 0;
+	u32 gate_unresolved = 0;
+	int from_ksu;
 	int retried = 0;
 
 	/* ---- argv ---- */
@@ -719,6 +784,14 @@ void insmod_main(long argc, char **argv)
 		plen += alen;
 	}
 	params[plen] = 0;
+
+	/* Which world this load belongs to is decided by two KernelSU hints - this loader's own domain
+	 * (ksud runs in u:r:ksu:s0; Magisk and APatch do not) and KernelSU's module directory; the
+	 * gate-symbol block below says how they combine.  Neither is a parameter: a device is not
+	 * something the caller declares, and a wrong claim could only move the module between "ask
+	 * KernelSU" and "keep the old rule" - never make it call a pinned zero, which is what the
+	 * stand-in below is for. */
+	from_ksu = is_ksu_domain();
 
 	/* ---- map the module image read/write private ---- */
 	fd = sys6(SYS_openat, AT_FDCWD, (sysarg)path, O_RDONLY, 0, 0, 0);
@@ -890,6 +963,61 @@ void insmod_main(long argc, char **argv)
 		}
 	}
 
+	/* ---- the KernelSU gate symbol (issue #34) ----
+	 *
+	 * The module asks KernelSU's ksu_uid_should_umount() whether susfs hiding applies to a given
+	 * uid.  On a KernelSU device that name resolved above like every other one.  Everywhere else
+	 * there is no such symbol, and leaving it SHN_UNDEF would make the kernel refuse the entire
+	 * load with "Unknown symbol" - so when both hints below are silent this loader stands in for
+	 * it: pin it to 0 and say so to the module with is_magisk=1, which makes the gates answer the
+	 * old uid rule and never call that address.
+	 *
+	 * What decides it, in order: a resolved symbol first (KernelSU is really there, whatever loaded
+	 * the module), then two independent hints that this load belongs to KernelSU - the loader's own
+	 * SELinux domain being u:r:ksu*, or KernelSU's /sys/module/kernelsu existing.  ONE of them is
+	 * enough to take the KernelSU path; only when neither says so is the symbol stood in for.  Both
+	 * halves are needed because neither is always readable: some KernelSU builds hide their module
+	 * directory (measured on the project's device), and a KernelSU device may be loaded from a
+	 * context that never switched domain.
+	 *
+	 * An unresolved symbol on the KernelSU path is a failed load on purpose - standing in there
+	 * would load a module whose gates silently stay on the pre-#34 rule. */
+	for (i = 0; i < nundef; i++) {
+		struct undef *u = &undefs[i];
+
+		if (u->len != (u32)(sizeof(ksu_gate_symbol) - 1) ||
+		    !s_eq_n(u->name, ksu_gate_symbol, sizeof(ksu_gate_symbol) - 1))
+			continue;
+		if (u->resolved)
+			break;		/* KernelSU is there and supplied the address */
+		gate_unresolved = 1;
+		if (!from_ksu && !kernelsu_sysfs_present()) {
+			u->sym->st_shndx = SHN_ABS;
+			u->sym->st_value = 0;
+			u->resolved = 1;
+			gate_pinned = 1;
+		}
+		break;
+	}
+
+	if (gate_pinned) {
+		static const char mp[] = " is_magisk=1";
+		u64 mn = sizeof(mp) - 1;
+
+		if (plen + mn >= sizeof(params))
+			die("module parameters too long (the kernel caps them at 4096 bytes)", -7);
+		copy_n(params + plen, mp, mn);
+		plen += mn;
+		params[plen] = 0;
+
+		o_put(P "note: ");
+		o_putn(ksu_gate_symbol, sizeof(ksu_gate_symbol) - 1);
+		o_put(" is not in kallsyms, and neither this loader's domain (");
+		o_put(current_domain);
+		o_put(") nor " KSU_SYSFS_DIR " says KernelSU is here: pinned it to 0 and passed is_magisk=1, so the module keeps the uid >= 10000 rule.  If this device does have KernelSU, load kernelsu.ko first and reload this module to get issue #34's fix\n");
+		o_flush();
+	}
+
 	resolved = nundef - bad_sym;
 	for (i = 0; i < nundef; i++) {
 		if (undefs[i].resolved)
@@ -929,6 +1057,17 @@ void insmod_main(long argc, char **argv)
 		if (unresolved > listed)
 			o_put(" ...");
 		o_put("\n");
+		o_flush();
+	}
+
+	/* The loud counterpart of the stand-in above: the name is left unresolved on purpose, so the
+	 * kernel will refuse the load.  Say why, or the only visible symptom is "Unknown symbol". */
+	if (gate_unresolved && !gate_pinned) {
+		o_put(P "note: KernelSU's ");
+		o_putn(ksu_gate_symbol, sizeof(ksu_gate_symbol) - 1);
+		o_put(" did not resolve, but this load counts as KernelSU (domain ");
+		o_put(current_domain);
+		o_put(" or " KSU_SYSFS_DIR "): standing in for the symbol would load the module and silently keep the pre-#34 uid rule, so this load is left to fail with \"Unknown symbol\" instead.  Either kernelsu.ko is not loaded yet (load this module after it) or it is older than that symbol.\n");
 		o_flush();
 	}
 

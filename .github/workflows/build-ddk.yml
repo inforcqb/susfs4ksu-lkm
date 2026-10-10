@@ -399,8 +399,37 @@ jobs:
             exit 1
           fi
           miss=0
+          skipped=0
+          # Everything below leans on sym_count(), which reads System.map and falls back to vmlinux; a tree with
+          # neither would make every name look missing and fail obscurely, so say what is wrong instead.
+          [ -r "$S/System.map" ] || [ -r "$S/vmlinux" ] || {
+            echo "::error::the symbol source $S has neither a readable System.map nor a vmlinux, so this gate cannot check anything"
+            exit 1
+          }
+          # ONE name is deliberately not the kernel's: ksu_uid_should_umount belongs to kernelsu.ko.  On the
+          # device it is a LOCAL `t` symbol and that module exports nothing at all (it has no __ksymtab), so it
+          # cannot be in any kernel image - module symbols never reach System.map in the first place, exporting
+          # one would not change that.  It is the KernelSU decision the hide gates have to ask (issue #34), and
+          # the two loaders this project ships cover both worlds: `ksud insmod` resolves it, and `susfs_insmod`
+          # stands in for it (pin to 0 + is_magisk=1) only when neither KernelSU hint fires (the loader's own
+          # domain is u:r:ksu*, or /sys/module/kernelsu exists), leaving it unresolved - and the load loud -
+          # when a hint does say KernelSU but the symbol is missing
+          # (tools/susfs_insmod.c, kernel/ksu_umount_gate.c).  Every other name still has to be in the tree.
+          KSU_PROVIDED="ksu_uid_should_umount"
           while read -r s; do
             [ -n "$s" ] || continue
+            if [ "$s" = "$KSU_PROVIDED" ]; then
+              skipped=$((skipped + 1))
+              # sym_count() carries the vmlinux/readelf fallbacks, so this holds for a tree without a
+              # System.map too - the point is only that a name which IS available in the tree must not
+              # be silently exempted.
+              if [ "$(sym_count "$s")" != "0" ]; then
+                echo "::error::$s IS present in $S - the exception below is stale, drop it"
+                exit 1
+              fi
+              echo "  $s: skipped (supplied by kernelsu.ko at run time, never in the kernel image)"
+              continue
+            fi
             n=$(sym_count "$s")
             if [ "$n" = "0" ]; then
               echo "::error::'$s' is undefined in the module but not present in $S (variant $V) - no loader can supply its address on this kernel"
@@ -411,7 +440,13 @@ jobs:
             echo "::error::$miss undefined symbol(s) of the module are missing from $S (variant $V)"
             exit 1
           fi
-          echo "  all $tu undefined symbols are present in $S"
+          # The exception is auditable: if it stops firing, the name is gone from the import list (drop the
+          # exception with it) or it was renamed.
+          if [ "$skipped" != "1" ]; then
+            echo "::error::the kernelsu.ko exception did not fire exactly once (skipped=$skipped) - either $KSU_PROVIDED is no longer imported (drop the exception) or the name changed"
+            exit 1
+          fi
+          echo "  all $((tu - skipped)) undefined symbols are present in $S, plus $skipped supplied by another module"
 
       # The module resolves a SECOND class of symbols BY NAME at runtime
       # (kernel/symbol_resolver.c: find_kernel_symbol_exact, kprobe bootstrap).  Those never
