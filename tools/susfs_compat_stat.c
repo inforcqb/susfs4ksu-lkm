@@ -233,15 +233,52 @@ static int name_is(const char *p, const char *needle)
 	return *p == 0;
 }
 
-static u32 scan_dir(long fd, int compat, const char *needle, u32 *entries)
+/* Raw occurrence count over the WHOLE chunk, not just over the part the record chain
+ * describes.  A caller is free to ignore the length getdents64 returned and search the bytes
+ * itself, so a name that is only gone from the CHAIN is not hidden.  That is how the module
+ * used to drop an entry: it compacted the chain and left the dropped record's bytes - the
+ * whole name, its d_ino and its d_off - in the tail it no longer described, which is invisible
+ * to the record walk below (it stops at n) and visible to this counter. */
+static u32 scan_raw(const char *buf, long n, const char *needle)
+{
+	u32 hits = 0;
+	long i, k, nl = 0;
+
+	if (!needle || !needle[0])
+		return 0;
+	while (needle[nl])
+		nl++;
+	for (i = 0; i + nl <= n; i++) {
+		for (k = 0; k < nl; k++)
+			if (buf[i + k] != needle[k])
+				break;
+		if (k == nl)
+			hits++;
+	}
+	return hits;
+}
+
+static u32 scan_dir(long fd, int compat, const char *needle, u32 *entries,
+		    u32 *raw_hits, u32 *tail_hits)
 {
 	u32 matches = 0;
 	long n;
 
 	*entries = 0;
+	*raw_hits = 0;
+	*tail_hits = 0;
 	while ((n = sys4(compat ? __NR_getdents : __NR_getdents64,
 			 fd, (long)dirbuf, DIRBUF, 0)) > 0) {
 		long off = 0;
+
+		/* Both raw counts describe the chunk the kernel just filled ([0, n)), never the
+		 * stale bytes a shorter read left behind.  `tail_hits` looks for the name without
+		 * its first byte: the all-hidden placeholder zeroes name[0], and "susfs_kstat"
+		 * then sits in the buffer as "usfs_kstat" - a name the full-needle search cannot
+		 * see. */
+		*raw_hits += scan_raw(dirbuf, n, needle);
+		if (needle && needle[0])
+			*tail_hits += scan_raw(dirbuf, n, needle + 1);
 
 		while (off < n) {
 			u32 reclen, nameoff;
@@ -273,16 +310,30 @@ static u32 scan_dir(long fd, int compat, const char *needle, u32 *entries)
 	return matches;
 }
 
+/* What one chunk tells a caller, at four levels of trust in the returned length:
+ *   entries     - records the chain describes (what a readdir() loop walks)
+ *   needle_hits - times the needle appears as a complete record name in that chain
+ *   raw_hits    - times the needle appears anywhere in the chunk the kernel filled,
+ *                 including the bytes the chain stopped describing: a process that ignores
+ *                 the returned length reads the hidden names back here
+ *   tail_hits   - times the needle without its first byte appears in the same bytes, which
+ *                 is all that a placeholder zeroing name[0] leaves of it
+ * A hidden entry must score 0 on the last three; only then is it gone from the buffer and
+ * not merely missing from the chain. */
 static void show_dirents(long dirfd, int compat, const char *needle)
 {
-	u32 pos = 0, entries = 0;
-	u32 matches = scan_dir(dirfd, compat, needle, &entries);
+	u32 pos = 0, entries = 0, raw_hits = 0, tail_hits = 0;
+	u32 matches = scan_dir(dirfd, compat, needle, &entries, &raw_hits, &tail_hits);
 
 	pos = put(out, pos, compat ? "getdents(141)  " : "getdents64(217)");
 	pos = put(out, pos, " entries=");
 	pos = putnum(out, pos, entries, 0);
 	pos = put(out, pos, " needle_hits=");
 	pos = putnum(out, pos, matches, 0);
+	pos = put(out, pos, " raw_hits=");
+	pos = putnum(out, pos, raw_hits, 0);
+	pos = put(out, pos, " name_tail_hits=");
+	pos = putnum(out, pos, tail_hits, 0);
 	pos = put(out, pos, "\n");
 	sys4(SYS_write, 1, (long)out, pos, 0);
 }
@@ -341,8 +392,10 @@ void compat_main(long argc, char **argv)
 		show("fstat64  ", rc);
 	}
 
-	/* Both listing interfaces, on the directory that holds the hidden entry:
-	 * the needle must be missing from BOTH. */
+	/* Both listing interfaces, on the directory that holds the hidden entry: the needle
+	 * must be missing from BOTH - and, for a rule that hides it, from the raw bytes of
+	 * every chunk too (raw_hits=0, name_tail_hits=0), which is the difference between
+	 * "the chain does not mention it" and "the buffer does not contain it". */
 	fd = sys4(SYS_open, (long)dir, 0, 0, 0);
 	if (fd < 0) {
 		pos = 0;
